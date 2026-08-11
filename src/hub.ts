@@ -6,7 +6,7 @@ import { FAVICON_SVG, HUB_CLIENT_JS, HUB_HTML, HUB_STYLES_CSS } from "#workbench
 import { discoverLocalBranches, inspectOpenSpecCandidate } from "./git.js";
 import { WorkbenchLauncher } from "./launcher.js";
 import { ProjectRegistry, validateRegisteredProject, validateRegisteredProjectRoot, type RegisteredProject } from "./registry.js";
-import { RegistrationIntents, type FolderPicker } from "./registration.js";
+import { createNativeFolderPicker, RegistrationIntents, type FolderPicker } from "./registration.js";
 import { WorkbenchError, type GitSnapshot, type LocalBranch } from "./types.js";
 
 const HUB_CSP = ["default-src 'none'", "base-uri 'none'", "connect-src 'self'", "font-src 'self'", "form-action 'none'", "frame-ancestors 'none'", "img-src 'self' data:", "object-src 'none'", "script-src 'self'", "style-src 'self'"].join("; ");
@@ -189,7 +189,9 @@ export async function startHub(registry = new ProjectRegistry(), requestedPort =
   const token = randomBytes(32).toString("base64url");
   const csrf = randomBytes(32).toString("base64url");
   const launcher = new WorkbenchLauncher(runtimePath);
-  const registrationIntents = new RegistrationIntents(picker);
+  const folderPicker = picker ?? createNativeFolderPicker();
+  const registrationIntents = new RegistrationIntents(folderPicker);
+  const registrationAvailable = folderPicker.available !== false;
   const publicOrigin = requestedPublicOrigin ? exactPublicOrigin(requestedPublicOrigin) : undefined;
   const trustedProxy = publicOrigin !== undefined;
   const stableBindings = new Map<string, StableRouteBinding>();
@@ -237,15 +239,16 @@ export async function startHub(registry = new ProjectRegistry(), requestedPort =
         json(response, 403, { error: { code: "TARGET_REJECTED", message: "The absolute request target is not allowed." } });
         return;
       }
-      if (trustedProxy && (request.method === "POST" || request.method === "DELETE")) {
+      if (request.method === "POST" || request.method === "DELETE") {
         const fetchSite = request.headers["sec-fetch-site"];
-        if (request.headers.origin !== authorityOrigin || request.headers["x-openspec-client"] !== "1" || (fetchSite !== undefined && fetchSite !== "same-origin" && fetchSite !== "none")) {
+        if (request.headers.origin !== authorityOrigin || request.headers["x-openspec-client"] !== "1" || fetchSite !== "same-origin") {
           json(response, 403, { error: { code: "MUTATION_AUTHORITY_REJECTED", message: "The project launch request is not from the trusted Hub client." } });
           return;
         }
       }
       if (url.pathname === "/" && (request.method === "GET" || request.method === "HEAD")) {
-        if (!trustedProxy && !equalToken(url.searchParams.get("token") ?? "", token)) {
+        const queryCapability = url.searchParams.get("token") ?? "";
+        if (!trustedProxy && queryCapability && !equalToken(queryCapability, token)) {
           json(response, 401, { error: { code: "CAPABILITY_REQUIRED", message: "A valid local Hub capability is required." } });
           return;
         }
@@ -266,10 +269,6 @@ export async function startHub(registry = new ProjectRegistry(), requestedPort =
       if (url.pathname === "/favicon.svg" && (request.method === "GET" || request.method === "HEAD")) {
         headers(response, "image/svg+xml; charset=utf-8");
         response.end(request.method === "HEAD" ? undefined : FAVICON_SVG);
-        return;
-      }
-      if (url.pathname === "/api/bootstrap" && request.method === "GET") {
-        json(response, 200, { csrf: trustedProxy ? csrf : "", registrationAvailable: trustedProxy });
         return;
       }
       if (trustedProxy && (request.method === "GET" || request.method === "HEAD" || request.method === "POST")) {
@@ -305,11 +304,18 @@ export async function startHub(registry = new ProjectRegistry(), requestedPort =
         json(response, 401, { error: { code: "CAPABILITY_REQUIRED", message: "A valid local Hub capability is required." } });
         return;
       }
+      if (url.pathname === "/api/bootstrap" && request.method === "GET") {
+        json(response, 200, { csrf, registrationAvailable });
+        return;
+      }
+      if ((request.method === "POST" || request.method === "DELETE") && !equalToken(String(request.headers["x-openspec-csrf"] ?? ""), csrf)) {
+        json(response, 403, { error: { code: "MUTATION_CSRF_REJECTED", message: "The Hub mutation request is not authorized." } });
+        return;
+      }
       const match = /^\/api\/project\/([^/]+)\/open$/u.exec(url.pathname);
       const removalMatch = /^\/api\/projects\/([A-Za-z0-9_-]{16,64})$/u.exec(url.pathname);
       const intentMatch = /^\/api\/project-registration-intents\/([A-Za-z0-9_-]{32})(?:\/(confirm))?$/u.exec(url.pathname);
       if (url.pathname === "/api/project-registration-intents" && request.method === "POST") {
-        if (!trustedProxy || !equalToken(String(request.headers["x-openspec-csrf"] ?? ""), csrf)) throw new WorkbenchError("REGISTRATION_AUTHORITY_REJECTED", "The registration request is not authorized.", 403);
         const body = await readJsonBody(request);
         const operation = body.operation;
         if (operation === "add" && exactBody(body, ["operation"])) {
@@ -327,19 +333,16 @@ export async function startHub(registry = new ProjectRegistry(), requestedPort =
         return;
       }
       if (intentMatch && !intentMatch[2] && request.method === "DELETE") {
-        if (!trustedProxy || !equalToken(String(request.headers["x-openspec-csrf"] ?? ""), csrf)) throw new WorkbenchError("REGISTRATION_AUTHORITY_REJECTED", "The registration request is not authorized.", 403);
         json(response, 200, registrationIntents.cancel(intentMatch[1] ?? ""));
         return;
       }
       if (intentMatch?.[2] === "confirm" && request.method === "POST") {
-        if (!trustedProxy || !equalToken(String(request.headers["x-openspec-csrf"] ?? ""), csrf)) throw new WorkbenchError("REGISTRATION_AUTHORITY_REJECTED", "The registration request is not authorized.", 403);
         const body = await readJsonBody(request);
         if (!exactBody(body, ["label"]) || typeof body.label !== "string") throw new WorkbenchError("PROJECT_LABEL_INVALID", "The project label is invalid.", 400);
         json(response, 200, await registrationIntents.confirm(intentMatch[1] ?? "", body.label, registry, launcher));
         return;
       }
       if (removalMatch && request.method === "DELETE") {
-        if (!trustedProxy || !equalToken(String(request.headers["x-openspec-csrf"] ?? ""), csrf)) throw new WorkbenchError("REGISTRATION_AUTHORITY_REJECTED", "The project removal request is not authorized.", 403);
         if (url.search || request.headers["content-length"] && request.headers["content-length"] !== "0" || request.headers["transfer-encoding"]) {
           request.resume();
           throw new WorkbenchError("PROJECT_REMOVAL_INVALID", "The project removal request has unknown or invalid fields.", 400);

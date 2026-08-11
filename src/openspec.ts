@@ -1,14 +1,34 @@
 import { execFile as execFileCallback } from "node:child_process";
+import { lstat, readFile, realpath } from "node:fs/promises";
 import os from "node:os";
+import path from "node:path";
 import process from "node:process";
 import { promisify } from "node:util";
 import type { OpenSpecRunner } from "./types.js";
 import { WorkbenchError } from "./types.js";
 
 const execFile = promisify(execFileCallback);
-const SAFE_PROJECT_ENV_KEYS = ["HOME", "PATH", "TMPDIR", "TMP", "TEMP", "LANG", "LC_ALL", "XDG_CONFIG_HOME", "XDG_DATA_HOME", "XDG_STATE_HOME"] as const;
+const SAFE_PROJECT_ENV_KEYS = [
+  "HOME",
+  "PATH",
+  "TMPDIR",
+  "TMP",
+  "TEMP",
+  "LANG",
+  "LC_ALL",
+  "XDG_CONFIG_HOME",
+  "XDG_DATA_HOME",
+  "XDG_STATE_HOME",
+  "SystemRoot",
+  "ComSpec",
+  "PATHEXT",
+  "USERPROFILE",
+  "APPDATA",
+  "LOCALAPPDATA",
+] as const;
+const PACKAGE_JSON_LIMIT = 1024 * 1024;
 
-function projectCommandEnvironment(root: string): NodeJS.ProcessEnv {
+function projectCommandEnvironment(root: string, platform: NodeJS.Platform): NodeJS.ProcessEnv {
   const environment: NodeJS.ProcessEnv = {};
   for (const key of SAFE_PROJECT_ENV_KEYS) {
     const value = process.env[key];
@@ -17,7 +37,7 @@ function projectCommandEnvironment(root: string): NodeJS.ProcessEnv {
   environment.HOME = os.homedir();
   environment.PATH = process.env.PATH ?? "";
   environment.PWD = root;
-  environment.BROWSER = process.platform === "win32" ? "NUL" : "/usr/bin/false";
+  environment.BROWSER = platform === "win32" ? "NUL" : "/usr/bin/false";
   environment.GIT_TERMINAL_PROMPT = "0";
   environment.NO_COLOR = "1";
   environment.npm_config_ignore_scripts = "true";
@@ -37,6 +57,7 @@ function extractJson(output: string): unknown {
 }
 
 function classifyCommandError(error: unknown): WorkbenchError {
+  if (error instanceof WorkbenchError) return error;
   const candidate = error as NodeJS.ErrnoException & { killed?: boolean; signal?: NodeJS.Signals | null };
   if (candidate.code === "ERR_CHILD_PROCESS_STDIO_MAXBUFFER") {
     return new WorkbenchError("OPENSPEC_OUTPUT_LIMIT", "The project-local OpenSpec command exceeded its output limit.", 502);
@@ -45,17 +66,78 @@ function classifyCommandError(error: unknown): WorkbenchError {
     return new WorkbenchError("OPENSPEC_TIMEOUT", "The project-local OpenSpec command timed out.", 503);
   }
   if (candidate.code === "ENOENT") {
-    return new WorkbenchError("OPENSPEC_UNAVAILABLE", "The repository-pinned OpenSpec command is unavailable.", 503);
+    return new WorkbenchError("OPENSPEC_RUNNER_UNAVAILABLE", "The local npm JavaScript runner is unavailable.", 503);
   }
   return new WorkbenchError("OPENSPEC_COMMAND_FAILED", "The repository-pinned OpenSpec command failed.", 502);
 }
 
-async function executePinned(root: string, args: readonly string[], limits: { maxBuffer: number; timeout: number }): Promise<string> {
+async function assertOpenSpecScript(root: string): Promise<void> {
+  const packagePath = path.join(root, "package.json");
+  let bytes: Buffer;
   try {
-    const { stdout } = await execFile("npm", ["run", "--silent", "openspec", "--", ...args], {
+    const info = await lstat(packagePath);
+    if (!info.isFile() || info.isSymbolicLink() || info.size > PACKAGE_JSON_LIMIT) throw new Error("invalid package metadata");
+    bytes = await readFile(packagePath);
+  } catch {
+    throw new WorkbenchError("OPENSPEC_SCRIPT_MISSING", "The selected project does not declare a local openspec script.", 409);
+  }
+  try {
+    const value = JSON.parse(bytes.toString("utf8")) as { scripts?: { openspec?: unknown } };
+    if (typeof value.scripts?.openspec !== "string" || value.scripts.openspec.trim().length < 1 || value.scripts.openspec.length > 4_096 || value.scripts.openspec.includes("\0")) throw new Error("invalid script");
+  } catch {
+    throw new WorkbenchError("OPENSPEC_SCRIPT_MISSING", "The selected project does not declare a local openspec script.", 409);
+  }
+}
+
+async function validNpmCli(candidate: string | undefined): Promise<string | null> {
+  if (!candidate || !path.isAbsolute(candidate) || !/(?:^|[\\/])npm-cli\.(?:c?js|mjs)$/iu.test(candidate)) return null;
+  try {
+    const candidateInfo = await lstat(candidate);
+    if (!candidateInfo.isFile() || candidateInfo.isSymbolicLink()) return null;
+    const canonical = await realpath(candidate);
+    const info = await lstat(canonical);
+    return info.isFile() && !info.isSymbolicLink() ? canonical : null;
+  } catch {
+    return null;
+  }
+}
+
+export function npmCliCandidatesForTesting(
+  platform: NodeJS.Platform,
+  nodeExecutable = process.execPath,
+  npmExecPath = process.env.npm_execpath,
+): Array<string | undefined> {
+  if (platform === "win32") {
+    return [npmExecPath, path.win32.join(path.win32.dirname(nodeExecutable), "node_modules", "npm", "bin", "npm-cli.js")];
+  }
+  return [npmExecPath, path.posix.resolve(path.posix.dirname(nodeExecutable), "..", "lib", "node_modules", "npm", "bin", "npm-cli.js")];
+}
+
+async function resolveNpmCli(explicit: string | undefined, platform: NodeJS.Platform): Promise<string> {
+  const candidates = explicit === undefined
+    ? npmCliCandidatesForTesting(platform)
+    : [explicit];
+  for (const candidate of candidates) {
+    const resolved = await validNpmCli(candidate);
+    if (resolved) return resolved;
+  }
+  throw new WorkbenchError("OPENSPEC_RUNNER_UNAVAILABLE", "The local npm JavaScript runner is unavailable.", 503);
+}
+
+async function executePinned(
+  root: string,
+  args: readonly string[],
+  limits: { maxBuffer: number; timeout: number },
+  npmCliPath: string | undefined,
+  platform: NodeJS.Platform,
+): Promise<string> {
+  try {
+    await assertOpenSpecScript(root);
+    const npmCli = await resolveNpmCli(npmCliPath, platform);
+    const { stdout } = await execFile(process.execPath, [npmCli, "run", "--silent", "openspec", "--", ...args], {
       cwd: root,
       encoding: "utf8",
-      env: projectCommandEnvironment(root),
+      env: projectCommandEnvironment(root, platform),
       maxBuffer: limits.maxBuffer,
       timeout: limits.timeout,
     });
@@ -67,13 +149,13 @@ async function executePinned(root: string, args: readonly string[], limits: { ma
 
 export function createPinnedOpenSpecRunner(
   root: string,
-  limits: { versionTimeoutMs?: number; commandTimeoutMs?: number } = {},
+  limits: { versionTimeoutMs?: number; commandTimeoutMs?: number; npmCliPath?: string; platform?: NodeJS.Platform } = {},
 ): OpenSpecRunner {
   let versionPromise: Promise<string> | null = null;
   return {
     async version() {
       if (!versionPromise) {
-        versionPromise = executePinned(root, ["--version"], { maxBuffer: 64 * 1024, timeout: limits.versionTimeoutMs ?? 30_000 })
+        versionPromise = executePinned(root, ["--version"], { maxBuffer: 64 * 1024, timeout: limits.versionTimeoutMs ?? 30_000 }, limits.npmCliPath, limits.platform ?? process.platform)
           .then((output) => {
             const version = output.trim();
             if (!/^\d+\.\d+\.\d+$/u.test(version)) {
@@ -89,7 +171,7 @@ export function createPinnedOpenSpecRunner(
       return versionPromise;
     },
     async run(args) {
-      return extractJson(await executePinned(root, args, { maxBuffer: 8 * 1024 * 1024, timeout: limits.commandTimeoutMs ?? 30_000 }));
+      return extractJson(await executePinned(root, args, { maxBuffer: 8 * 1024 * 1024, timeout: limits.commandTimeoutMs ?? 30_000 }, limits.npmCliPath, limits.platform ?? process.platform));
     },
   };
 }

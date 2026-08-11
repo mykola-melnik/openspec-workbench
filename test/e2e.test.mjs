@@ -95,6 +95,39 @@ async function trustedHubRequest(instance, pathname, options = {}) {
   return new Response(response.body, { status: response.status, headers: response.headers });
 }
 
+async function launchRuntimeUntilOutput(runtime, args, cwd) {
+  const child = spawn(process.execPath, [runtime, ...args], { cwd, stdio: ["ignore", "pipe", "pipe"] });
+  let output = "";
+  let errorOutput = "";
+  child.stdout.setEncoding("utf8");
+  child.stderr.setEncoding("utf8");
+  child.stdout.on("data", (chunk) => { output += chunk; });
+  child.stderr.on("data", (chunk) => { errorOutput += chunk; });
+  const outcome = await new Promise((resolve, reject) => {
+    const timer = setTimeout(() => resolve({ kind: "listening" }), 750);
+    child.once("error", (error) => { clearTimeout(timer); reject(error); });
+    child.once("exit", (code) => { clearTimeout(timer); resolve({ kind: "exit", code }); });
+    const poll = setInterval(() => {
+      if (/http:\/\/127\.0\.0\.1:\d+\//u.test(output)) {
+        clearInterval(poll);
+        clearTimeout(timer);
+        resolve({ kind: "listening" });
+      }
+    }, 10);
+    poll.unref();
+  });
+  return { child, output, errorOutput, outcome };
+}
+
+async function stopRuntime(child) {
+  if (child.exitCode !== null || child.signalCode !== null) return;
+  await new Promise((resolve) => {
+    const timer = setTimeout(resolve, 1_000);
+    child.once("exit", () => { clearTimeout(timer); resolve(); });
+    child.kill("SIGTERM");
+  });
+}
+
 test("serves a read-only worktree projection behind a capability", async () => {
   const root = await createFixture();
   const before = await state(root);
@@ -129,6 +162,25 @@ test("serves a read-only worktree projection behind a capability", async () => {
     assert.equal(detail.tasks.length, 2);
     assert.match(detail.proposal[0].body, /<script>/u);
     assert.deepEqual(await state(root), before);
+  } finally {
+    await instance.close();
+    await rm(root, { recursive: true, force: true });
+  }
+});
+
+test("snapshot failures return a typed terminal OpenSpec error instead of an endless loading response", async () => {
+  const root = await createFixture();
+  const instance = await startWorkbench(root);
+  try {
+    await writeFile(path.join(root, "package.json"), JSON.stringify({ name: "fixture-project", scripts: {} }), "utf8");
+    const response = await request(instance, "/api/snapshot", { headers: { Authorization: `Bearer ${instance.token}` } });
+    assert.equal(response.status, 409);
+    assert.deepEqual(await response.json(), {
+      error: {
+        code: "OPENSPEC_SCRIPT_MISSING",
+        message: "The selected project does not declare a local openspec script.",
+      },
+    });
   } finally {
     await instance.close();
     await rm(root, { recursive: true, force: true });
@@ -364,12 +416,12 @@ test("rejects hostile Host, Origin, method, traversal and cross-root selection",
   }
 });
 
-test("launches the standalone runtime without creating consumer state", async () => {
+test("launches the explicit standalone runtime without creating consumer state", async () => {
   const root = await createFixture();
   const testDirectory = path.dirname(fileURLToPath(import.meta.url));
   const builtRuntime = path.resolve(testDirectory, "../.workbench-build/server.mjs");
   const beforeConsumer = await state(root);
-  const child = spawn(process.execPath, [builtRuntime, "--root", root], { cwd: root, stdio: ["ignore", "pipe", "pipe"] });
+  const child = spawn(process.execPath, [builtRuntime, "project", "--root", await realpath(root)], { cwd: root, stdio: ["ignore", "pipe", "pipe"] });
   try {
     const url = await new Promise((resolve, reject) => {
       let output = "";
@@ -400,6 +452,70 @@ test("launches the standalone runtime without creating consumer state", async ()
   }
 });
 
+test("ordinary runtime launch opens the Hub and advanced project mode requires an explicit canonical root", async () => {
+  const root = await createFixture({ name: "startup-contract" });
+  const stateDirectory = await mkdtemp(path.join(os.tmpdir(), "owb-startup-state-"));
+  const runtime = path.resolve(path.dirname(fileURLToPath(import.meta.url)), "../.workbench-build/server.mjs");
+  const ordinary = await launchRuntimeUntilOutput(runtime, ["--state-dir", stateDirectory], root);
+  try {
+    assert.equal(ordinary.outcome.kind, "listening");
+    assert.match(ordinary.output, /OpenSpec Projects Hub/u);
+    assert.doesNotMatch(ordinary.output, /OpenSpec Workbench/u);
+  } finally {
+    await stopRuntime(ordinary.child);
+  }
+
+  const missingRoot = await launchRuntimeUntilOutput(runtime, ["project"], root);
+  try {
+    assert.equal(missingRoot.outcome.kind, "exit");
+    assert.notEqual(missingRoot.outcome.code, 0);
+    assert.match(missingRoot.errorOutput, /ROOT_REQUIRED/u);
+  } finally {
+    await stopRuntime(missingRoot.child);
+  }
+
+  const relativeRoot = await launchRuntimeUntilOutput(runtime, ["project", "--root", "."], root);
+  try {
+    assert.equal(relativeRoot.outcome.kind, "exit");
+    assert.notEqual(relativeRoot.outcome.code, 0);
+    assert.match(relativeRoot.errorOutput, /ROOT_ABSOLUTE_REQUIRED/u);
+  } finally {
+    await stopRuntime(relativeRoot.child);
+  }
+
+  const project = await launchRuntimeUntilOutput(runtime, ["project", "--root", await realpath(root)], root);
+  try {
+    assert.equal(project.outcome.kind, "listening");
+    assert.match(project.output, /OpenSpec Workbench/u);
+  } finally {
+    await stopRuntime(project.child);
+  }
+
+  const rootWithTrailingSeparator = `${await realpath(root)}${path.sep}`;
+  const normalizedProject = await launchRuntimeUntilOutput(runtime, ["project", "--root", rootWithTrailingSeparator], root);
+  try {
+    assert.equal(normalizedProject.outcome.kind, "listening");
+    assert.match(normalizedProject.output, /OpenSpec Workbench/u);
+  } finally {
+    await stopRuntime(normalizedProject.child);
+    await rm(root, { recursive: true, force: true });
+    await rm(stateDirectory, { recursive: true, force: true });
+  }
+});
+
+test("one-root child does not expose Hub registration routes", async () => {
+  const root = await createFixture();
+  const instance = await startWorkbench(root);
+  try {
+    const headers = { Authorization: `Bearer ${instance.token}` };
+    assert.equal((await request(instance, "/api/bootstrap", { headers })).status, 404);
+    assert.equal((await request(instance, "/api/project-registration-intents", { headers })).status, 404);
+  } finally {
+    await instance.close();
+    await rm(root, { recursive: true, force: true });
+  }
+});
+
 test("Hub lists differing supported standards pins and opens isolated verified project instances", async () => {
   const first = await createFixture({ name: "hub-first", standardsVersion: "v1.6.1" });
   const second = await createFixture({ name: "hub-second", standardsVersion: "v1.8.0" });
@@ -413,6 +529,10 @@ test("Hub lists differing supported standards pins and opens isolated verified p
   await rm(stale, { recursive: true, force: true });
   const hub = await startHub(registry);
   try {
+    assert.equal((await request(hub, `/?token=${hub.token}`)).status, 200);
+    assert.equal((await request(hub, "/")).status, 200);
+    assert.equal((await request(hub, "/?token=wrong")).status, 401);
+    assert.equal((await request(hub, "/api/bootstrap")).status, 401);
     assert.equal((await request(hub, "/api/projects")).status, 401);
     assert.equal(await rawStatus(hub, "/api/projects", { Authorization: `Bearer ${hub.token}`, Host: "evil.invalid" }), 403);
     assert.equal((await request(hub, "/api/projects", { headers: { Authorization: `Bearer ${hub.token}`, Origin: "https://evil.invalid" } })).status, 403);
@@ -421,7 +541,18 @@ test("Hub lists differing supported standards pins and opens isolated verified p
     assert.deepEqual(projects.map((project) => project.label), ["First project", "Second project", "Stale project"]);
     assert.equal(projects.some((project) => project.root === hidden), false);
     assert.equal(projects.find((project) => project.label === "Stale project")?.available, false);
-    const launchResponse = await request(hub, `/api/project/${firstProject.id}/open`, { method: "POST", headers: { Authorization: `Bearer ${hub.token}` } });
+    const bootstrap = await (await request(hub, "/api/bootstrap", { headers: { Authorization: `Bearer ${hub.token}` } })).json();
+    assert.equal(bootstrap.registrationAvailable, process.platform === "darwin" || process.platform === "win32");
+    const launchResponse = await request(hub, `/api/project/${firstProject.id}/open`, {
+      method: "POST",
+      headers: {
+        Authorization: `Bearer ${hub.token}`,
+        Origin: hub.origin,
+        "X-OpenSpec-Client": "1",
+        "X-OpenSpec-CSRF": bootstrap.csrf,
+        "Sec-Fetch-Site": "same-origin",
+      },
+    });
     assert.equal(launchResponse.status, 200);
     const launch = await launchResponse.json();
     const identity = await (await fetch(`${new URL(launch.url).origin}/api/identity`, { headers: { Authorization: `Bearer ${new URL(launch.url).searchParams.get("token")}` } })).json();
@@ -438,6 +569,92 @@ test("Hub lists differing supported standards pins and opens isolated verified p
   }
 });
 
+test("Hub hides native registration when its folder picker is unavailable", async () => {
+  const stateDirectory = await mkdtemp(path.join(os.tmpdir(), "owb-unsupported-picker-state-"));
+  const registry = new ProjectRegistry(stateDirectory);
+  const picker = {
+    available: false,
+    async pick() { throw new Error("unreachable"); },
+  };
+  const hub = await startHub(registry, 0, undefined, undefined, picker);
+  try {
+    const bootstrap = await (await request(hub, "/api/bootstrap", {
+      headers: { Authorization: `Bearer ${hub.token}` },
+    })).json();
+    assert.equal(bootstrap.registrationAvailable, false);
+  } finally {
+    await hub.close();
+    await rm(stateDirectory, { recursive: true, force: true });
+  }
+});
+
+test("portable capability Hub registers a chosen folder without accepting browser paths", async () => {
+  const root = await createFixture({ name: "portable-picked" });
+  const before = await state(root);
+  const stateDirectory = await mkdtemp(path.join(os.tmpdir(), "owb-portable-picker-state-"));
+  const registry = new ProjectRegistry(stateDirectory);
+  let pickerCalls = 0;
+  const picker = { async pick() { pickerCalls += 1; return root; } };
+  const hub = await startHub(registry, 0, undefined, undefined, picker);
+  try {
+    assert.equal((await request(hub, "/api/bootstrap")).status, 401);
+    const authorization = { Authorization: `Bearer ${hub.token}` };
+    const bootstrap = await (await request(hub, "/api/bootstrap", { headers: authorization })).json();
+    assert.equal(bootstrap.registrationAvailable, true);
+    const mutationHeaders = {
+      ...authorization,
+      Origin: hub.origin,
+      "X-OpenSpec-Client": "1",
+      "X-OpenSpec-CSRF": bootstrap.csrf,
+      "Sec-Fetch-Site": "same-origin",
+      "Content-Type": "application/json",
+    };
+    const { Origin: _omittedOrigin, ...missingOriginHeaders } = mutationHeaders;
+    assert.equal((await request(hub, "/api/project-registration-intents", {
+      method: "POST",
+      headers: missingOriginHeaders,
+      body: JSON.stringify({ operation: "add" }),
+    })).status, 403);
+    assert.equal((await request(hub, "/api/project-registration-intents", {
+      method: "POST",
+      headers: { ...mutationHeaders, "Sec-Fetch-Site": "cross-site" },
+      body: JSON.stringify({ operation: "add" }),
+    })).status, 403);
+    const wrongCsrf = await request(hub, "/api/project-registration-intents", {
+      method: "POST",
+      headers: { ...mutationHeaders, "X-OpenSpec-CSRF": "wrong" },
+      body: JSON.stringify({ operation: "add" }),
+    });
+    assert.equal(wrongCsrf.status, 403);
+    assert.equal(pickerCalls, 0);
+    const pathBearing = await request(hub, "/api/project-registration-intents", {
+      method: "POST", headers: mutationHeaders, body: JSON.stringify({ operation: "add", path: root }),
+    });
+    assert.equal(pathBearing.status, 400);
+    assert.equal(pickerCalls, 0);
+    let intent = await (await request(hub, "/api/project-registration-intents", {
+      method: "POST", headers: mutationHeaders, body: JSON.stringify({ operation: "add" }),
+    })).json();
+    for (let attempt = 0; attempt < 40 && intent.state === "selecting"; attempt += 1) {
+      await new Promise((resolve) => setTimeout(resolve, 10));
+      intent = await (await request(hub, `/api/project-registration-intents/${intent.id}`, { headers: authorization })).json();
+    }
+    assert.equal(intent.state, "preview");
+    const confirmed = await request(hub, `/api/project-registration-intents/${intent.id}/confirm`, {
+      method: "POST", headers: mutationHeaders, body: JSON.stringify({ label: "Portable project" }),
+    });
+    assert.equal(confirmed.status, 200);
+    assert.equal((await confirmed.json()).result.label, "Portable project");
+    assert.equal(pickerCalls, 1);
+    assert.deepEqual((await registry.list()).map((project) => project.label), ["Portable project"]);
+    assert.deepEqual(await state(root), before);
+  } finally {
+    await hub.close();
+    await rm(root, { recursive: true, force: true });
+    await rm(stateDirectory, { recursive: true, force: true });
+  }
+});
+
 test("trusted local proxy Hub enforces exact authority while retaining child capabilities", async () => {
   const root = await createFixture({ name: "trusted-hub" });
   const stateDirectory = await mkdtemp(path.join(os.tmpdir(), "owb-trusted-hub-state-"));
@@ -445,6 +662,7 @@ test("trusted local proxy Hub enforces exact authority while retaining child cap
   const project = await registry.register(root, "Trusted project");
   const hub = await startHub(registry, 0, undefined, "https://plans.internal");
   try {
+    const csrf = (await (await trustedHubRequest(hub, "/api/bootstrap")).json()).csrf;
     assert.equal(hub.url, "https://plans.internal/");
     const page = await trustedHubRequest(hub, "/");
     assert.equal(page.status, 200);
@@ -470,7 +688,7 @@ test("trusted local proxy Hub enforces exact authority while retaining child cap
 
     const launchResponse = await trustedHubRequest(hub, openPath, {
       method: "POST",
-      headers: { Origin: "https://plans.internal", "X-OpenSpec-Client": "1", "Sec-Fetch-Site": "same-origin" },
+      headers: { Origin: "https://plans.internal", "X-OpenSpec-Client": "1", "X-OpenSpec-CSRF": csrf, "Sec-Fetch-Site": "same-origin" },
     });
     assert.equal(launchResponse.status, 200);
     assert.equal(launchResponse.headers.get("access-control-allow-origin"), null);

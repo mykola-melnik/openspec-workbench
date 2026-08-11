@@ -82,6 +82,7 @@ type ActivityEntry = {
   data: { changeId?: string; providerId?: TranslationProviderId; paths?: string[]; additionalPaths?: number; previousRevision?: string; revision?: string; missingBlocks?: number; translatedBlocks?: number; failedBlocks?: number; validationState?: string; diagnostic?: string };
 };
 type ActivityResponse = { entries: ActivityEntry[]; limit: number; scope: "process" };
+const API_TIMEOUT_MS = 45_000;
 
 const elements = {
   app: required("app"),
@@ -303,6 +304,27 @@ function el<K extends keyof HTMLElementTagNameMap>(name: K, className?: string, 
   return element;
 }
 
+class ApiError extends Error {
+  constructor(readonly code: string, message: string) {
+    super(message);
+    this.name = "ApiError";
+  }
+}
+
+function localizedApiError(error: unknown, fallback: string = copy.readFailure): string {
+  if (!(error instanceof ApiError)) return error instanceof Error ? error.message : fallback;
+  if (error.code === "CAPABILITY_REQUIRED") return copy.missingCapability;
+  if (error.code === "REQUEST_TIMEOUT") return copy.requestTimedOut;
+  if (error.code === "NETWORK_UNAVAILABLE") return copy.networkUnavailable;
+  if (error.code === "OPENSPEC_RUNNER_UNAVAILABLE") return copy.openSpecRunnerUnavailable;
+  if (error.code === "OPENSPEC_SCRIPT_MISSING") return copy.openSpecScriptMissing;
+  if (error.code === "OPENSPEC_COMMAND_FAILED") return copy.openSpecCommandFailed;
+  if (error.code === "OPENSPEC_TIMEOUT") return copy.openSpecTimedOut;
+  if (error.code === "OPENSPEC_OUTPUT_LIMIT") return copy.openSpecOutputLimit;
+  if (["OPENSPEC_VERSION_UNSUPPORTED", "OPENSPEC_OUTPUT_INVALID"].includes(error.code)) return copy.unsupported;
+  return fallback;
+}
+
 async function api<T>(path: string, options: string | { method?: string; body?: Record<string, unknown> } = "GET"): Promise<T> {
   const method = typeof options === "string" ? options : options.method ?? "GET";
   const headers: Record<string, string> = {};
@@ -310,10 +332,35 @@ async function api<T>(path: string, options: string | { method?: string; body?: 
   if (method === "POST") headers["X-OpenSpec-Client"] = "1";
   const requestBody = typeof options === "object" ? options.body : undefined;
   if (requestBody) headers["Content-Type"] = "application/json";
-  const response = await fetch(`${publicBase}${path.replace(/^\//u, "")}`, { method, headers, ...(requestBody ? { body: JSON.stringify(requestBody) } : {}) });
-  const responseBody = await response.json() as T & { error?: { message: string } };
-  if (!response.ok) throw new Error(responseBody.error?.message ?? copy.readFailure);
-  return responseBody;
+  const controller = new AbortController();
+  let timedOut = false;
+  const timeout = window.setTimeout(() => {
+    timedOut = true;
+    controller.abort();
+  }, API_TIMEOUT_MS);
+  try {
+    let response: Response;
+    try {
+      response = await fetch(`${publicBase}${path.replace(/^\//u, "")}`, {
+        method,
+        headers,
+        signal: controller.signal,
+        ...(requestBody ? { body: JSON.stringify(requestBody) } : {}),
+      });
+    } catch {
+      throw new ApiError(timedOut ? "REQUEST_TIMEOUT" : "NETWORK_UNAVAILABLE", timedOut ? copy.requestTimedOut : copy.networkUnavailable);
+    }
+    let responseBody: T & { error?: { code?: string; message?: string } };
+    try {
+      responseBody = await response.json() as T & { error?: { code?: string; message?: string } };
+    } catch {
+      throw new ApiError("RESPONSE_INVALID", copy.readFailure);
+    }
+    if (!response.ok) throw new ApiError(responseBody.error?.code ?? "UNKNOWN", responseBody.error?.message ?? copy.readFailure);
+    return responseBody;
+  } finally {
+    window.clearTimeout(timeout);
+  }
 }
 
 const activityKindSet = new Set<ActivityKind>([
@@ -883,7 +930,7 @@ async function selectChange(id: string): Promise<void> {
     if (language !== "en" && providerCanTranslate() && (currentTranslation(id)?.usage.missingBlocks ?? 0) > 0) void completeMissingTranslation(id);
   } catch (error) {
     if (generation !== clientGeneration) return;
-    elements.state.textContent = error instanceof Error ? error.message : copy.planReadFailure;
+    elements.state.textContent = localizedApiError(error, copy.planReadFailure);
   }
 }
 
@@ -1083,5 +1130,8 @@ updateLanguageButtons();
 setTranslationProvider(translationProvider);
 void start().catch((error: unknown) => {
   elements.app.setAttribute("aria-busy", "false");
-  elements.state.textContent = error instanceof Error ? error.message : copy.startupFailure;
+  elements.project.textContent = copy.projectUnavailable;
+  elements.detail.hidden = true;
+  elements.state.hidden = false;
+  elements.state.textContent = localizedApiError(error, copy.startupFailure);
 });

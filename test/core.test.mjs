@@ -1,7 +1,9 @@
 import assert from "node:assert/strict";
+import { EventEmitter } from "node:events";
 import { chmod, mkdir, mkdtemp, readFile, realpath, rename, rm, symlink, writeFile } from "node:fs/promises";
 import os from "node:os";
 import path from "node:path";
+import { PassThrough } from "node:stream";
 import test from "node:test";
 import { setTimeout as delay } from "node:timers/promises";
 import {
@@ -15,6 +17,7 @@ import {
   WorkbenchError,
   ProjectRegistry,
   RegistrationIntents,
+  WindowsFolderPicker,
   adaptArtifactStatus,
   adaptChangeList,
   adaptDoctor,
@@ -26,8 +29,10 @@ import {
   createPinnedOpenSpecRunner,
   classifyAgyFailureForTesting,
   buildCliInvocation,
+  createNativeFolderPicker,
   discoverOllamaModels,
   decodeMacFolderPickerOutputForTesting,
+  decodeWindowsFolderPickerOutputForTesting,
   detectGitDirtyForTesting,
   deriveTreeParents,
   discoverGitSnapshot,
@@ -36,6 +41,7 @@ import {
   isArchiveReadyChange,
   isCompletedChange,
   maskProtectedText,
+  npmCliCandidatesForTesting,
   openSpecContentIdentity,
   openSpecContentState,
   parseExplicitChangeDependencies,
@@ -207,6 +213,91 @@ test("macOS picker output preserves spaces, Unicode, and embedded newlines", () 
   assert.throws(() => decodeMacFolderPickerOutputForTesting("relative/path\n"), (error) => error?.code === "PICKER_OUTPUT_INVALID");
 });
 
+test("Windows picker uses a fixed shell-free invocation and decodes absolute Unicode paths", async () => {
+  const selected = "C:\\Users\\Example\\Проєкт з пробілом";
+  const encoded = Buffer.from(selected, "utf8").toString("base64");
+  assert.equal(decodeWindowsFolderPickerOutputForTesting(encoded), selected);
+  assert.equal(decodeWindowsFolderPickerOutputForTesting("__OPENSPEC_PICKER_CANCELLED__"), null);
+  assert.throws(() => decodeWindowsFolderPickerOutputForTesting(Buffer.from("relative\\path", "utf8").toString("base64")), (error) => error?.code === "PICKER_OUTPUT_INVALID");
+  assert.throws(() => decodeWindowsFolderPickerOutputForTesting("__OPENSPEC_PICKER_NO_GUI__"), (error) => error?.code === "NO_GUI_SESSION");
+
+  let invocation;
+  const fakeSpawn = (executable, args, options) => {
+    invocation = { executable, args, options };
+    const child = new EventEmitter();
+    child.stdout = new PassThrough();
+    child.stderr = new PassThrough();
+    child.exitCode = null;
+    child.signalCode = null;
+    child.kill = () => true;
+    queueMicrotask(() => {
+      child.stdout.write(encoded);
+      child.exitCode = 0;
+      child.emit("close", 0);
+    });
+    return child;
+  };
+  const picker = new WindowsFolderPicker(fakeSpawn, "C:\\Windows", 100, "win32");
+  assert.equal(await picker.pick(), selected);
+  assert.equal(invocation.executable, "C:\\Windows\\System32\\WindowsPowerShell\\v1.0\\powershell.exe");
+  assert.deepEqual(invocation.args.slice(0, 5), ["-NoLogo", "-NoProfile", "-NonInteractive", "-STA", "-Command"]);
+  assert.equal(invocation.options.shell, false);
+  assert.doesNotMatch(invocation.args[5], new RegExp(selected.replace(/[.*+?^${}()|[\]\\]/gu, "\\$&"), "u"));
+});
+
+test("Windows picker platform validation cannot be bypassed by an injected process", async () => {
+  const fakeSpawn = () => { throw new Error("unreachable"); };
+  await assert.rejects(
+    new WindowsFolderPicker(fakeSpawn, "C:\\Windows", 100, "linux").pick(),
+    (error) => error?.code === "PICKER_UNSUPPORTED",
+  );
+});
+
+test("native picker selection fails visibly on unsupported platforms and Windows timeout kills the helper", async () => {
+  await assert.rejects(createNativeFolderPicker("linux").pick(), (error) => error?.code === "PICKER_UNSUPPORTED");
+  assert.equal(createNativeFolderPicker("darwin").constructor.name, "MacFolderPicker");
+  assert.equal(createNativeFolderPicker("win32").constructor.name, "WindowsFolderPicker");
+
+  let killed = false;
+  const fakeSpawn = () => {
+    const child = new EventEmitter();
+    child.stdout = new PassThrough();
+    child.stderr = new PassThrough();
+    child.exitCode = null;
+    child.signalCode = null;
+    child.kill = (signal) => {
+      killed = signal === "SIGKILL";
+      child.signalCode = signal;
+      queueMicrotask(() => child.emit("close", null));
+      return true;
+    };
+    return child;
+  };
+  await assert.rejects(new WindowsFolderPicker(fakeSpawn, "C:\\Windows", 5, "win32").pick(), (error) => error?.code === "PICKER_TIMEOUT");
+  assert.equal(killed, true);
+
+  let closeSignal = null;
+  const closeSpawn = () => {
+    const child = new EventEmitter();
+    child.stdout = new PassThrough();
+    child.stderr = new PassThrough();
+    child.exitCode = null;
+    child.signalCode = null;
+    child.kill = (signal) => {
+      closeSignal = signal;
+      child.signalCode = signal;
+      queueMicrotask(() => child.emit("close", null));
+      return true;
+    };
+    return child;
+  };
+  const closePicker = new WindowsFolderPicker(closeSpawn, "C:\\Windows", 1_000, "win32");
+  const pending = closePicker.pick();
+  await closePicker.close();
+  await assert.rejects(pending, (error) => error?.code === "PICKER_FAILED");
+  assert.equal(closeSignal, "SIGTERM");
+});
+
 test("project-local OpenSpec version checks use a bounded configurable timeout", async () => {
   const root = await createFixture({ openSpecDelayMs: 100 });
   try {
@@ -217,6 +308,72 @@ test("project-local OpenSpec version checks use a bounded configurable timeout",
     assert.equal(await createPinnedOpenSpecRunner(root, { versionTimeoutMs: 2_000 }).version(), "1.7.0");
   } finally {
     await rm(root, { recursive: true, force: true });
+  }
+});
+
+test("OpenSpec runner validates project script metadata and an explicit npm JavaScript entry", async () => {
+  const npmCli = process.env.npm_execpath;
+  assert.ok(npmCli, "npm_execpath must be available under npm test");
+
+  const missing = await createFixture();
+  const malformed = await createFixture();
+  const oversized = await createFixture();
+  const nonFile = await createFixture();
+  const invalidRunner = await createFixture();
+  try {
+    await writeFile(path.join(missing, "package.json"), JSON.stringify({ name: "missing", scripts: {} }), "utf8");
+    await assert.rejects(createPinnedOpenSpecRunner(missing, { npmCliPath: npmCli }).version(), (error) => error?.code === "OPENSPEC_SCRIPT_MISSING");
+
+    await writeFile(path.join(malformed, "package.json"), "{not-json", "utf8");
+    await assert.rejects(createPinnedOpenSpecRunner(malformed, { npmCliPath: npmCli }).version(), (error) => error?.code === "OPENSPEC_SCRIPT_MISSING");
+
+    await writeFile(path.join(oversized, "package.json"), Buffer.alloc(1024 * 1024 + 1, 0x20));
+    await assert.rejects(createPinnedOpenSpecRunner(oversized, { npmCliPath: npmCli }).version(), (error) => error?.code === "OPENSPEC_SCRIPT_MISSING");
+
+    await rm(path.join(nonFile, "package.json"));
+    await mkdir(path.join(nonFile, "package.json"));
+    await assert.rejects(createPinnedOpenSpecRunner(nonFile, { npmCliPath: npmCli }).version(), (error) => error?.code === "OPENSPEC_SCRIPT_MISSING");
+
+    await assert.rejects(createPinnedOpenSpecRunner(invalidRunner, { npmCliPath: "relative/npm-cli.js" }).version(), (error) => error?.code === "OPENSPEC_RUNNER_UNAVAILABLE");
+    await assert.rejects(createPinnedOpenSpecRunner(invalidRunner, { npmCliPath: path.join(invalidRunner, "missing", "npm-cli.js") }).version(), (error) => error?.code === "OPENSPEC_RUNNER_UNAVAILABLE");
+  } finally {
+    await Promise.all([missing, malformed, oversized, nonFile, invalidRunner].map((root) => rm(root, { recursive: true, force: true })));
+  }
+});
+
+test("OpenSpec runner derives bounded Windows and Unix npm CLI candidates", () => {
+  assert.deepEqual(
+    npmCliCandidatesForTesting("win32", "C:\\Program Files\\nodejs\\node.exe", "C:\\portable\\npm-cli.js"),
+    ["C:\\portable\\npm-cli.js", "C:\\Program Files\\nodejs\\node_modules\\npm\\bin\\npm-cli.js"],
+  );
+  assert.deepEqual(
+    npmCliCandidatesForTesting("darwin", "/usr/local/bin/node", "/opt/npm/bin/npm-cli.js"),
+    ["/opt/npm/bin/npm-cli.js", "/usr/local/lib/node_modules/npm/bin/npm-cli.js"],
+  );
+});
+
+test("OpenSpec runner keeps shell metacharacters and spaces as literal script arguments", async () => {
+  const root = await createFixture({ commandLog: true });
+  try {
+    await createPinnedOpenSpecRunner(root).run(["status", "--change", "space & whoami | echo", "--json"]);
+    const logged = (await readFile(path.join(root, ".openspec-command-log"), "utf8")).trim().split("\n").map((line) => JSON.parse(line));
+    assert.deepEqual(logged.at(-1), ["status", "--change", "space & whoami | echo", "--json"]);
+  } finally {
+    await rm(root, { recursive: true, force: true });
+  }
+});
+
+test("OpenSpec runner keeps timeout, output-limit, and non-zero failure codes distinct", async () => {
+  const timeout = await createFixture({ openSpecDelayMs: 100 });
+  const outputLimit = await createFixture({ openSpecVersion: "1".repeat(70 * 1024) });
+  const failure = await createFixture();
+  try {
+    await writeFile(path.join(failure, "package.json"), JSON.stringify({ name: "broken", scripts: { openspec: "missing-openspec-command" } }), "utf8");
+    await assert.rejects(createPinnedOpenSpecRunner(timeout, { versionTimeoutMs: 20 }).version(), (error) => error?.code === "OPENSPEC_TIMEOUT");
+    await assert.rejects(createPinnedOpenSpecRunner(outputLimit).version(), (error) => error?.code === "OPENSPEC_OUTPUT_LIMIT");
+    await assert.rejects(createPinnedOpenSpecRunner(failure).version(), (error) => error?.code === "OPENSPEC_COMMAND_FAILED");
+  } finally {
+    await Promise.all([timeout, outputLimit, failure].map((root) => rm(root, { recursive: true, force: true })));
   }
 });
 

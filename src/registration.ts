@@ -9,17 +9,35 @@ import { verifyOpenSpecCompatibility } from "./compatibility.js";
 import { WorkbenchError } from "./types.js";
 
 export interface FolderPicker {
+  readonly available?: boolean;
   pick(): Promise<string | null>;
   close?(): Promise<void>;
 }
 
 const PICKER_CANCELLED = "__OPENSPEC_PICKER_CANCELLED__";
+const PICKER_NO_GUI = "__OPENSPEC_PICKER_NO_GUI__";
 const PICKER_SOURCE = `try
   set selectedFolder to choose folder with prompt "Choose an OpenSpec project folder"
   return POSIX path of selectedFolder
 on error number -128
   return "${PICKER_CANCELLED}"
 end try`;
+const WINDOWS_PICKER_SOURCE = `$ErrorActionPreference = 'Stop'
+Add-Type -AssemblyName System.Windows.Forms
+if (-not [Environment]::UserInteractive) {
+  [Console]::Out.Write('${PICKER_NO_GUI}')
+  exit 3
+}
+$dialog = New-Object System.Windows.Forms.FolderBrowserDialog
+$dialog.Description = 'Choose an OpenSpec project folder'
+$dialog.ShowNewFolderButton = $false
+$result = $dialog.ShowDialog()
+if ($result -eq [System.Windows.Forms.DialogResult]::OK) {
+  $bytes = [System.Text.Encoding]::UTF8.GetBytes($dialog.SelectedPath)
+  [Console]::Out.Write([Convert]::ToBase64String($bytes))
+} else {
+  [Console]::Out.Write('${PICKER_CANCELLED}')
+}`;
 
 export function decodeMacFolderPickerOutputForTesting(stdout: string): string | null {
   const value = stdout.endsWith("\n") ? stdout.slice(0, -1) : stdout;
@@ -28,18 +46,41 @@ export function decodeMacFolderPickerOutputForTesting(stdout: string): string | 
   throw new WorkbenchError("PICKER_OUTPUT_INVALID", "The native folder chooser returned an invalid selection.", 502);
 }
 
+export function decodeWindowsFolderPickerOutputForTesting(stdout: string): string | null {
+  const value = stdout.endsWith("\r\n") ? stdout.slice(0, -2) : stdout.endsWith("\n") ? stdout.slice(0, -1) : stdout;
+  if (value === PICKER_CANCELLED) return null;
+  if (value === PICKER_NO_GUI) throw new WorkbenchError("NO_GUI_SESSION", "No interactive Windows session is available for folder selection.", 503);
+  if (!/^(?:[A-Za-z0-9+/]{4})*(?:[A-Za-z0-9+/]{2}==|[A-Za-z0-9+/]{3}=)?$/u.test(value) || value.length === 0) {
+    throw new WorkbenchError("PICKER_OUTPUT_INVALID", "The native folder chooser returned an invalid selection.", 502);
+  }
+  const decoded = Buffer.from(value, "base64").toString("utf8");
+  if (Buffer.from(decoded, "utf8").toString("base64") !== value || decoded.includes("\0") || !path.win32.isAbsolute(decoded)) {
+    throw new WorkbenchError("PICKER_OUTPUT_INVALID", "The native folder chooser returned an invalid selection.", 502);
+  }
+  return decoded;
+}
+
 export class MacFolderPicker implements FolderPicker {
   private child: ReturnType<typeof spawn> | null = null;
 
+  constructor(
+    private readonly spawnProcess: typeof spawn = spawn,
+    private readonly platform: NodeJS.Platform = process.platform,
+  ) {}
+
+  get available(): boolean {
+    return this.platform === "darwin";
+  }
+
   async pick(): Promise<string | null> {
-    if (process.platform !== "darwin") throw new WorkbenchError("PICKER_UNSUPPORTED", "Native folder selection is supported on macOS only.", 501);
+    if (!this.available) throw new WorkbenchError("PICKER_UNSUPPORTED", "Native folder selection is supported on macOS only.", 501);
     if (this.child) throw new WorkbenchError("PICKER_BUSY", "A folder chooser is already open.", 409);
     return new Promise((resolve, reject) => {
       let stdout = "";
       let stderr = "";
       let overflow = false;
       let timedOut = false;
-      const child = spawn("/usr/bin/osascript", ["-e", PICKER_SOURCE], { stdio: ["ignore", "pipe", "pipe"] });
+      const child = this.spawnProcess("/usr/bin/osascript", ["-e", PICKER_SOURCE], { shell: false, stdio: ["ignore", "pipe", "pipe"] });
       this.child = child;
       const timer = setTimeout(() => { timedOut = true; child.kill("SIGKILL"); }, 2 * 60_000);
       child.stdout.setEncoding("utf8");
@@ -74,6 +115,84 @@ export class MacFolderPicker implements FolderPicker {
   async close(): Promise<void> {
     if (this.child?.exitCode === null && this.child.signalCode === null) this.child.kill("SIGTERM");
   }
+}
+
+export class WindowsFolderPicker implements FolderPicker {
+  private child: ReturnType<typeof spawn> | null = null;
+
+  constructor(
+    private readonly spawnProcess: typeof spawn = spawn,
+    private readonly systemRoot = process.env.SystemRoot ?? "C:\\Windows",
+    private readonly timeoutMs = 2 * 60_000,
+    private readonly platform: NodeJS.Platform = process.platform,
+  ) {}
+
+  get available(): boolean {
+    return this.platform === "win32";
+  }
+
+  async pick(): Promise<string | null> {
+    if (!this.available) throw new WorkbenchError("PICKER_UNSUPPORTED", "Native Windows folder selection is unavailable on this platform.", 501);
+    if (this.child) throw new WorkbenchError("PICKER_BUSY", "A folder chooser is already open.", 409);
+    return new Promise((resolve, reject) => {
+      let stdout = "";
+      let stderr = "";
+      let overflow = false;
+      let timedOut = false;
+      const executable = path.win32.join(this.systemRoot, "System32", "WindowsPowerShell", "v1.0", "powershell.exe");
+      const child = this.spawnProcess(executable, ["-NoLogo", "-NoProfile", "-NonInteractive", "-STA", "-Command", WINDOWS_PICKER_SOURCE], {
+        shell: false,
+        windowsHide: true,
+        stdio: ["ignore", "pipe", "pipe"],
+      });
+      this.child = child;
+      const timer = setTimeout(() => { timedOut = true; child.kill("SIGKILL"); }, this.timeoutMs);
+      child.stdout.setEncoding("utf8");
+      child.stdout.on("data", (chunk: string) => {
+        stdout += chunk;
+        if (Buffer.byteLength(stdout) > 64 * 1024) {
+          overflow = true;
+          child.kill("SIGKILL");
+        }
+      });
+      child.stderr.setEncoding("utf8");
+      child.stderr.on("data", (chunk: string) => { stderr = `${stderr}${chunk}`.slice(-4_096); });
+      child.once("error", () => {
+        clearTimeout(timer);
+        this.child = null;
+        reject(new WorkbenchError("PICKER_UNAVAILABLE", "The native Windows folder chooser could not start.", 503));
+      });
+      child.once("close", (code) => {
+        clearTimeout(timer);
+        this.child = null;
+        if (overflow) return reject(new WorkbenchError("PICKER_OUTPUT_LIMIT", "The native folder chooser returned too much data.", 502));
+        if (timedOut) return reject(new WorkbenchError("PICKER_TIMEOUT", "The native folder chooser timed out.", 504));
+        if (stdout === PICKER_NO_GUI || stdout === `${PICKER_NO_GUI}\r\n` || stdout === `${PICKER_NO_GUI}\n`) return reject(new WorkbenchError("NO_GUI_SESSION", "No interactive Windows session is available for folder selection.", 503));
+        if (code !== 0 && /access|denied|permission|unauthorized/iu.test(stderr)) return reject(new WorkbenchError("PICKER_PERMISSION_DENIED", "Windows denied access to the selected folder.", 403));
+        if (code !== 0) return reject(new WorkbenchError("PICKER_FAILED", "The native Windows folder chooser could not complete.", 502));
+        try { resolve(decodeWindowsFolderPickerOutputForTesting(stdout)); }
+        catch (error) { reject(error); }
+      });
+    });
+  }
+
+  async close(): Promise<void> {
+    if (this.child?.exitCode === null && this.child.signalCode === null) this.child.kill("SIGTERM");
+  }
+}
+
+class UnsupportedFolderPicker implements FolderPicker {
+  readonly available = false;
+
+  async pick(): Promise<string | null> {
+    throw new WorkbenchError("PICKER_UNSUPPORTED", "Native folder selection is unavailable on this platform.", 501);
+  }
+}
+
+export function createNativeFolderPicker(platform: NodeJS.Platform = process.platform): FolderPicker {
+  if (platform === "darwin") return new MacFolderPicker(spawn, platform);
+  if (platform === "win32") return new WindowsFolderPicker(spawn, process.env.SystemRoot ?? "C:\\Windows", 2 * 60_000, platform);
+  return new UnsupportedFolderPicker();
 }
 
 type Operation = "add" | "rebind";
@@ -112,7 +231,7 @@ export class RegistrationIntents {
   private readonly intents = new Map<string, RegistrationIntent>();
   private activePicker: string | null = null;
 
-  constructor(private readonly picker: FolderPicker = new MacFolderPicker(), private readonly ttlMs = 2 * 60_000) {}
+  constructor(private readonly picker: FolderPicker = createNativeFolderPicker(), private readonly ttlMs = 2 * 60_000) {}
 
   start(operation: Operation, projectId: string | null, expectedRevision: number | null): PublicRegistrationIntent {
     this.expire();

@@ -251,7 +251,7 @@ export async function buildChangeVerification(root: string, changeId: string, ru
     ),
   ]);
   if ("value" in validationValue) validation = adaptValidation(validationValue.value);
-  else if (validationValue.error instanceof WorkbenchError && validationValue.error.code === "OPENSPEC_UNAVAILABLE") validation = { state: "unavailable", message: "Strict validation is currently unavailable." };
+  else if (validationValue.error instanceof WorkbenchError && validationValue.error.code === "OPENSPEC_RUNNER_UNAVAILABLE") validation = { state: "unavailable", message: "Strict validation is currently unavailable." };
   else throw validationValue.error;
   return { artifacts: adaptArtifactStatus(statusValue), validation };
 }

@@ -1,7 +1,7 @@
 export { detectGitDirtyForTesting, discoverGitSnapshot, discoverLocalBranches, inspectOpenSpecCandidate, projectBranchNavigation, runGitCommandForTesting, safeReadProjectFile } from "./git.js";
 export { ActivityJournal, activityDiagnostic, activityKinds } from "./activity.js";
 export { ProjectRegistry, defaultWorkbenchStateDirectory, validateRegisteredProject, validateRegisteredProjectRoot } from "./registry.js";
-export { adaptArtifactStatus, adaptChangeList, adaptDoctor, adaptValidation, createPinnedOpenSpecRunner } from "./openspec.js";
+export { adaptArtifactStatus, adaptChangeList, adaptDoctor, adaptValidation, createPinnedOpenSpecRunner, npmCliCandidatesForTesting } from "./openspec.js";
 export { compatibilityManifest, validateCompatibilityManifestForTesting, verifyOpenSpecCompatibility } from "./compatibility.js";
 export { buildChangeDetail, buildChangePreview, buildChangeVerification, buildSnapshot, deriveTreeParents, listChanges, parseExplicitChangeDependencies, parseSections, parseTasks } from "./projection.js";
 export { arrangeChangeTree } from "./change-tree.js";
@@ -16,4 +16,4 @@ export { discoverOllamaModels, OllamaTranslationAdapter, validateOllamaModel } f
 export { isTranslationProviderId, isTranslationProviderPreference, translationProviderIds, TranslationProviderRegistry } from "./translation-providers.js";
 export { openSpecContentIdentity, openSpecContentState, SnapshotWatcher } from "./watcher.js";
 export { WorkbenchError } from "./types.js";
-export { RegistrationIntents, decodeMacFolderPickerOutputForTesting } from "./registration.js";
+export { MacFolderPicker, RegistrationIntents, WindowsFolderPicker, createNativeFolderPicker, decodeMacFolderPickerOutputForTesting, decodeWindowsFolderPickerOutputForTesting } from "./registration.js";

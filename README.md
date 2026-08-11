@@ -26,6 +26,7 @@ full boundary.
 
 - Node.js 20.20 or newer
 - Git
+- A current browser that sends Fetch Metadata headers on same-origin requests
 - A project-local `npm run openspec -- <args>` command for each registered
   project
 
@@ -41,18 +42,35 @@ npm run verify
 The application is installed once. Consumer repositories keep their own
 OpenSpec and standards versions and receive no copy of this runtime.
 
-## Use one project
+## Start
 
 ```bash
-npm run start -- --root /absolute/path/to/project
+npm start
 ```
 
-The command prints a loopback-only capability URL. Open that exact URL in the
-local browser.
+The command starts the Projects Hub and prints a loopback-only capability URL.
+Open that exact URL in the local browser, choose **Додати проєкт**, and select
+the exact Git worktree root. The Hub starts empty on a clean installation and
+never treats the Workbench checkout or current directory as a project.
 
-## Projects Hub
+The native folder chooser requires an active desktop session. The implementation
+includes macOS and Windows adapters. macOS is the verified beta path; Windows
+desktop support is provisional until a clean-install interactive smoke test is
+recorded. Cancellation changes nothing. Linux hides native registration and
+uses the CLI recovery commands below. Headless sessions on otherwise supported
+platforms fail visibly and can use the same recovery path.
 
-Register projects explicitly:
+The launch token is removed from the address bar after the first authorized
+load and retained only for that browser tab's session. Reloading that tab works:
+the server may return the inert Hub shell without a token, while bootstrap and
+every project API remain capability-protected. Opening or copying the tokenless
+URL into a fresh tab shows `CAPABILITY_REQUIRED` and no project information. In
+that case, use the latest complete URL printed by the running process.
+
+## Projects Hub recovery commands
+
+Ordinary desktop use does not require terminal registration. If the native
+picker is unavailable, register and manage projects explicitly with:
 
 ```bash
 npm run project:register -- --root /absolute/path/to/project --label "Project name"
@@ -60,7 +78,7 @@ npm run projects
 npm run project:remove -- --project <project-id>
 ```
 
-Start the Hub:
+`npm run hub` remains an alias for the ordinary Hub startup:
 
 ```bash
 npm run hub
@@ -76,7 +94,7 @@ identity before navigation.
 
 ### Optional managed-Mac local domain
 
-The portable default is the loopback capability URL printed by `npm run hub`.
+The portable default is the loopback capability URL printed by `npm start`.
 On an explicitly managed development Mac, Caddy can expose the Hub at
 `https://plans.internal` and proxies it to the loopback-only
 `127.0.0.1:4057` listener. PM2 runs the deterministic committed bundle with:
@@ -88,8 +106,9 @@ npm run hub:local
 This explicit trusted-local-proxy mode removes the Hub capability from the
 stable browser URL. It accepts only the exact `plans.internal` Host and
 `https://plans.internal` Origin, emits no CORS permission, and requires the
-same-origin application header for project-launch POST requests. Project and
-worktree content keeps a separate ephemeral capability and one-root process.
+application marker, `Sec-Fetch-Site: same-origin`, and a per-process CSRF token
+for Hub mutations. Project and worktree content keeps a separate ephemeral
+capability and one-root process.
 The Hub proxy mode trusts the local operating-system user and operator-managed
 proxy; it is not a sandbox against another process already running as that same
 user. See [SECURITY.md](SECURITY.md) for the complete boundary.
@@ -110,8 +129,37 @@ npm test
 npm run test:e2e
 npm run verify:bundle
 npm run check:public
+npm run check:docs
 npm audit --audit-level=high
 ```
+
+Repository documentation is built with pinned MkDocs tooling:
+
+```bash
+python3 -m pip install --require-hashes --requirement requirements-docs.txt
+npm run docs:build
+```
+
+The strict build writes only ignored derived output. See the
+[documentation sources](docs/index.md), [release procedure](docs/release-operations.md),
+and [changelog](CHANGELOG.md).
+
+For diagnostics or integration work, an advanced one-project process remains
+available and requires one explicit absolute canonical root:
+
+```bash
+npm run project -- --root /absolute/path/to/project
+```
+
+On Windows, quote the absolute path when it contains spaces:
+
+```powershell
+npm run project -- --root "C:\Users\Example\My Project"
+```
+
+Running the one-project role without a root, with a relative root, or through a
+noncanonical alias fails before a listener is opened. This mode does not expose
+Hub registration routes.
 
 `PUBLICATION_MANIFEST.txt` is the exact sorted inventory for a public source
 snapshot. When a tracked public file is added, removed, or renamed, update that
@@ -145,8 +193,9 @@ under the [MIT License](LICENSE); dependency and build-tool attribution is recor
 
 ## Register projects from the Hub
 
-On the trusted local site, use **Додати проєкт** to open the macOS folder
-chooser. Select the exact Git worktree root. The Hub first performs a
+On the portable capability URL or optional trusted local site, use **Додати
+проєкт** to open the native macOS picker or provisional Windows desktop picker.
+Select the exact Git worktree root. The Hub first performs a
 non-executing structural preview, shows the canonical folder, branch, worktree
 kind, and an editable display name, and writes nothing until **Зареєструвати
 проєкт** is confirmed.
@@ -168,15 +217,20 @@ confirmation is explicit: only the machine-local registry record is removed;
 the project folder, Git repository, worktrees, and OpenSpec files are not
 changed or deleted.
 
-The picker requires an active macOS login GUI session. Cancellation changes
-nothing. Permission, timeout, incompatible OpenSpec, expired selection, and
-concurrent-update failures are shown without exposing raw process diagnostics.
-The CLI registration commands remain available as a recovery fallback, but are
-not required for ordinary site-based registration.
+The picker requires an active macOS login GUI session or interactive Windows
+desktop session. Windows desktop support remains provisional until the recorded
+clean-install smoke gate passes; Windows services, Session 0, and headless hosts
+are not supported. Cancellation changes nothing. Permission, timeout,
+incompatible OpenSpec, expired selection, and concurrent-update failures are
+shown without exposing raw process diagnostics. The CLI registration commands
+remain available as a recovery fallback, but are not required for ordinary
+registration on the verified macOS path.
 
 The structural folder preview does not execute project code. Confirmation and
 subsequent plan reads do execute the selected repository's explicit
-`npm run openspec -- <args>` script as the current local user. Register only
+`npm run openspec -- <args>` script as the current local user. Workbench invokes
+npm's validated JavaScript CLI through the running Node executable instead of a
+Windows `.cmd` shim. Register only
 repositories you trust to run code. This command is the consumer repository's
 authority boundary; OpenSpec Workbench bounds its arguments, output, and time,
 passes only a small runtime environment allowlist, and disables npm pre/post
@@ -263,8 +317,9 @@ content process clears its activity list.
 ## Local state and rollback
 
 On macOS, registry and accepted translation cache state live under
-`~/Library/Application Support/OpenSpec Workbench/`. Other platforms use their
-normal per-user application state directory.
+`~/Library/Application Support/OpenSpec Workbench/`. On Windows they live under
+`%LOCALAPPDATA%\OpenSpec Workbench\`. Other platforms use their normal per-user
+application state directory.
 
 Rollback stops the local process and restores a preceding immutable
 application version. It does not change project files, Git state, OpenSpec

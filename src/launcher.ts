@@ -71,7 +71,7 @@ export class WorkbenchLauncher {
   }
 
   private async start(expected: Awaited<ReturnType<typeof discoverGitSnapshot>>): Promise<LaunchedWorkbench> {
-    const child = spawn(process.execPath, [this.runtimePath, "--root", expected.root, "--machine"], {
+    const child = spawn(process.execPath, [this.runtimePath, "project", "--root", expected.root, "--machine"], {
       cwd: expected.root,
       stdio: ["ignore", "pipe", "pipe"],
     });

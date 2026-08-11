@@ -5,6 +5,14 @@ import test from "node:test";
 const sourceRoot = new URL("../src/", import.meta.url);
 const read = (name) => readFile(new URL(name, sourceRoot), "utf8");
 
+test("the public command contract is Hub-first and keeps project serving explicit", async () => {
+  const packageJson = JSON.parse(await readFile(new URL("../package.json", import.meta.url), "utf8"));
+  assert.match(packageJson.scripts.start, /server\.mjs --hub/u);
+  assert.equal(packageJson.scripts.hub, packageJson.scripts.start);
+  assert.match(packageJson.scripts.project, /server\.mjs project$/u);
+  assert.doesNotMatch(packageJson.scripts.project, /--root/u);
+});
+
 test("the shell exposes approved landmarks, provenance, search, language and safe states", async () => {
   const [html, client, locale, favicon] = await Promise.all([read("index.html"), read("client.ts"), read("locales.ts"), read("favicon.svg")]);
   assert.match(html, /<header id="topbar" class="topbar"/u);
@@ -24,6 +32,15 @@ test("the shell exposes approved landmarks, provenance, search, language and saf
   assert.match(client, /copy\.stale/u);
   assert.match(client, /copy\.unsupported/u);
   assert.match(client, /copy\.empty/u);
+  assert.match(client, /const API_TIMEOUT_MS = 45_000/u);
+  assert.match(client, /signal: controller\.signal/u);
+  assert.match(client, /elements\.project\.textContent = copy\.projectUnavailable/u);
+  assert.match(client, /elements\.state\.hidden = false/u);
+  assert.match(client, /localizedApiError\(error, copy\.startupFailure\)/u);
+  assert.match(locale, /openSpecRunnerUnavailable/u);
+  assert.match(locale, /openSpecScriptMissing/u);
+  assert.match(locale, /openSpecCommandFailed/u);
+  assert.match(locale, /requestTimedOut/u);
   assert.match(client, /translation-columns/u);
   assert.match(client, /\/translation/u);
   assert.match(locale, /Провайдера перекладу не вибрано/u);
@@ -128,14 +145,19 @@ test("the optional Hub exposes explicit project cards without plan editing contr
   assert.match(client, /copy\.hubDescription/u);
   assert.match(locale, /Лише проєкти, які ви явно зареєстрували/u);
   assert.match(client, /\/api\/projects/u);
-  assert.match(html, /id="add-project"/u);
+  assert.match(html, /id="add-project"[^>]+hidden disabled/u);
   assert.match(html, /id="registration-dialog"/u);
   assert.match(html, /id="removal-dialog"/u);
   assert.match(html, /<link rel="icon" href="\/favicon\.svg" type="image\/svg\+xml">/u);
   assert.match(client, /\/api\/project-registration-intents/u);
+  assert.match(client, /addProject\.disabled = !bootstrap\.registrationAvailable/u);
   assert.match(client, /copy\.removeFromHub/u);
   assert.match(client, /If-Match/u);
   assert.match(client, /location\.assign\(target\)/u);
+  assert.match(client, /error\.code === "NO_GUI_SESSION"/u);
+  assert.match(client, /copy\.openSpecRunnerUnavailable/u);
+  assert.match(client, /copy\.openSpecScriptMissing/u);
+  assert.match(client, /button\.textContent = copy\.tryAgain[\s\S]+button\.disabled = false/u);
   assert.doesNotMatch(`${html}\n${client}`, /edit|comment|checkout|switch/iu);
   assert.match(css, /@media \(max-width: 560px\)/u);
   assert.match(css, /prefers-reduced-motion/u);

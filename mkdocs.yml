@@ -1,0 +1,14 @@
+site_name: OpenSpec Workbench
+site_description: Read-only local browsing for Git-reviewed OpenSpec plans
+repo_url: https://github.com/mykola-melnik/openspec-workbench
+repo_name: mykola-melnik/openspec-workbench
+docs_dir: docs
+site_dir: .workbench-docs-site
+strict: true
+theme:
+  name: readthedocs
+nav:
+  - Overview: index.md
+  - Getting started: getting-started.md
+  - Security model: security.md
+  - Release operations: release-operations.md

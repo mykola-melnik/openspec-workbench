@@ -699,12 +699,32 @@ var ProjectRegistry = class {
 
 // src/openspec.ts
 import { execFile as execFileCallback } from "node:child_process";
+import { lstat as lstat3, readFile as readFile3, realpath as realpath3 } from "node:fs/promises";
 import os2 from "node:os";
+import path3 from "node:path";
 import process2 from "node:process";
 import { promisify } from "node:util";
 var execFile = promisify(execFileCallback);
-var SAFE_PROJECT_ENV_KEYS = ["HOME", "PATH", "TMPDIR", "TMP", "TEMP", "LANG", "LC_ALL", "XDG_CONFIG_HOME", "XDG_DATA_HOME", "XDG_STATE_HOME"];
-function projectCommandEnvironment(root) {
+var SAFE_PROJECT_ENV_KEYS = [
+  "HOME",
+  "PATH",
+  "TMPDIR",
+  "TMP",
+  "TEMP",
+  "LANG",
+  "LC_ALL",
+  "XDG_CONFIG_HOME",
+  "XDG_DATA_HOME",
+  "XDG_STATE_HOME",
+  "SystemRoot",
+  "ComSpec",
+  "PATHEXT",
+  "USERPROFILE",
+  "APPDATA",
+  "LOCALAPPDATA"
+];
+var PACKAGE_JSON_LIMIT = 1024 * 1024;
+function projectCommandEnvironment(root, platform) {
   const environment = {};
   for (const key of SAFE_PROJECT_ENV_KEYS) {
     const value = process2.env[key];
@@ -713,7 +733,7 @@ function projectCommandEnvironment(root) {
   environment.HOME = os2.homedir();
   environment.PATH = process2.env.PATH ?? "";
   environment.PWD = root;
-  environment.BROWSER = process2.platform === "win32" ? "NUL" : "/usr/bin/false";
+  environment.BROWSER = platform === "win32" ? "NUL" : "/usr/bin/false";
   environment.GIT_TERMINAL_PROMPT = "0";
   environment.NO_COLOR = "1";
   environment.npm_config_ignore_scripts = "true";
@@ -731,6 +751,7 @@ function extractJson(output) {
   }
 }
 function classifyCommandError(error) {
+  if (error instanceof WorkbenchError) return error;
   const candidate = error;
   if (candidate.code === "ERR_CHILD_PROCESS_STDIO_MAXBUFFER") {
     return new WorkbenchError("OPENSPEC_OUTPUT_LIMIT", "The project-local OpenSpec command exceeded its output limit.", 502);
@@ -739,16 +760,61 @@ function classifyCommandError(error) {
     return new WorkbenchError("OPENSPEC_TIMEOUT", "The project-local OpenSpec command timed out.", 503);
   }
   if (candidate.code === "ENOENT") {
-    return new WorkbenchError("OPENSPEC_UNAVAILABLE", "The repository-pinned OpenSpec command is unavailable.", 503);
+    return new WorkbenchError("OPENSPEC_RUNNER_UNAVAILABLE", "The local npm JavaScript runner is unavailable.", 503);
   }
   return new WorkbenchError("OPENSPEC_COMMAND_FAILED", "The repository-pinned OpenSpec command failed.", 502);
 }
-async function executePinned(root, args, limits) {
+async function assertOpenSpecScript(root) {
+  const packagePath = path3.join(root, "package.json");
+  let bytes;
   try {
-    const { stdout } = await execFile("npm", ["run", "--silent", "openspec", "--", ...args], {
+    const info = await lstat3(packagePath);
+    if (!info.isFile() || info.isSymbolicLink() || info.size > PACKAGE_JSON_LIMIT) throw new Error("invalid package metadata");
+    bytes = await readFile3(packagePath);
+  } catch {
+    throw new WorkbenchError("OPENSPEC_SCRIPT_MISSING", "The selected project does not declare a local openspec script.", 409);
+  }
+  try {
+    const value = JSON.parse(bytes.toString("utf8"));
+    if (typeof value.scripts?.openspec !== "string" || value.scripts.openspec.trim().length < 1 || value.scripts.openspec.length > 4096 || value.scripts.openspec.includes("\0")) throw new Error("invalid script");
+  } catch {
+    throw new WorkbenchError("OPENSPEC_SCRIPT_MISSING", "The selected project does not declare a local openspec script.", 409);
+  }
+}
+async function validNpmCli(candidate) {
+  if (!candidate || !path3.isAbsolute(candidate) || !/(?:^|[\\/])npm-cli\.(?:c?js|mjs)$/iu.test(candidate)) return null;
+  try {
+    const candidateInfo = await lstat3(candidate);
+    if (!candidateInfo.isFile() || candidateInfo.isSymbolicLink()) return null;
+    const canonical = await realpath3(candidate);
+    const info = await lstat3(canonical);
+    return info.isFile() && !info.isSymbolicLink() ? canonical : null;
+  } catch {
+    return null;
+  }
+}
+function npmCliCandidatesForTesting(platform, nodeExecutable = process2.execPath, npmExecPath = process2.env.npm_execpath) {
+  if (platform === "win32") {
+    return [npmExecPath, path3.win32.join(path3.win32.dirname(nodeExecutable), "node_modules", "npm", "bin", "npm-cli.js")];
+  }
+  return [npmExecPath, path3.posix.resolve(path3.posix.dirname(nodeExecutable), "..", "lib", "node_modules", "npm", "bin", "npm-cli.js")];
+}
+async function resolveNpmCli(explicit, platform) {
+  const candidates = explicit === void 0 ? npmCliCandidatesForTesting(platform) : [explicit];
+  for (const candidate of candidates) {
+    const resolved = await validNpmCli(candidate);
+    if (resolved) return resolved;
+  }
+  throw new WorkbenchError("OPENSPEC_RUNNER_UNAVAILABLE", "The local npm JavaScript runner is unavailable.", 503);
+}
+async function executePinned(root, args, limits, npmCliPath, platform) {
+  try {
+    await assertOpenSpecScript(root);
+    const npmCli = await resolveNpmCli(npmCliPath, platform);
+    const { stdout } = await execFile(process2.execPath, [npmCli, "run", "--silent", "openspec", "--", ...args], {
       cwd: root,
       encoding: "utf8",
-      env: projectCommandEnvironment(root),
+      env: projectCommandEnvironment(root, platform),
       maxBuffer: limits.maxBuffer,
       timeout: limits.timeout
     });
@@ -762,7 +828,7 @@ function createPinnedOpenSpecRunner(root, limits = {}) {
   return {
     async version() {
       if (!versionPromise) {
-        versionPromise = executePinned(root, ["--version"], { maxBuffer: 64 * 1024, timeout: limits.versionTimeoutMs ?? 3e4 }).then((output) => {
+        versionPromise = executePinned(root, ["--version"], { maxBuffer: 64 * 1024, timeout: limits.versionTimeoutMs ?? 3e4 }, limits.npmCliPath, limits.platform ?? process2.platform).then((output) => {
           const version = output.trim();
           if (!/^\d+\.\d+\.\d+$/u.test(version)) {
             throw new WorkbenchError("OPENSPEC_VERSION_UNSUPPORTED", "The project-local OpenSpec version response is not supported.", 409);
@@ -776,7 +842,7 @@ function createPinnedOpenSpecRunner(root, limits = {}) {
       return versionPromise;
     },
     async run(args) {
-      return extractJson(await executePinned(root, args, { maxBuffer: 8 * 1024 * 1024, timeout: limits.commandTimeoutMs ?? 3e4 }));
+      return extractJson(await executePinned(root, args, { maxBuffer: 8 * 1024 * 1024, timeout: limits.commandTimeoutMs ?? 3e4 }, limits.npmCliPath, limits.platform ?? process2.platform));
     }
   };
 }
@@ -924,7 +990,7 @@ async function verifyOpenSpecCompatibility(root, runner) {
 }
 
 // src/projection.ts
-import path3 from "node:path";
+import path4 from "node:path";
 function readableName(id) {
   return id.split(/[-_]/u).filter(Boolean).map((part) => part[0]?.toUpperCase() + part.slice(1)).join(" ");
 }
@@ -984,7 +1050,7 @@ async function projectName(root) {
     } catch {
     }
   }
-  return path3.basename(root);
+  return path4.basename(root);
 }
 function dependencyBlocks(content) {
   const blocks = [];
@@ -1065,7 +1131,7 @@ async function listChanges(root, runner) {
   }));
   const knownIds = new Set(flat.map((change) => change.id));
   const dependencies = await Promise.all(flat.map(async (change) => {
-    const proposalPath = path3.posix.join("openspec", "changes", change.id, "proposal.md");
+    const proposalPath = path4.posix.join("openspec", "changes", change.id, "proposal.md");
     let proposal = null;
     try {
       proposal = await safeReadProjectFile(root, proposalPath);
@@ -1115,10 +1181,10 @@ function assertChangeId(changeId) {
 }
 async function buildChangePreview(root, summary) {
   assertChangeId(summary.id);
-  const base = path3.posix.join("openspec", "changes", summary.id);
-  const proposalPath = path3.posix.join(base, "proposal.md");
-  const designPath = path3.posix.join(base, "design.md");
-  const tasksPath = path3.posix.join(base, "tasks.md");
+  const base = path4.posix.join("openspec", "changes", summary.id);
+  const proposalPath = path4.posix.join(base, "proposal.md");
+  const designPath = path4.posix.join(base, "design.md");
+  const tasksPath = path4.posix.join(base, "tasks.md");
   const [proposal, design, taskContent] = await Promise.all([
     safeReadProjectFile(root, proposalPath),
     safeReadProjectFile(root, designPath),
@@ -1149,7 +1215,7 @@ async function buildChangeVerification(root, changeId, runner) {
     )
   ]);
   if ("value" in validationValue) validation = adaptValidation(validationValue.value);
-  else if (validationValue.error instanceof WorkbenchError && validationValue.error.code === "OPENSPEC_UNAVAILABLE") validation = { state: "unavailable", message: "Strict validation is currently unavailable." };
+  else if (validationValue.error instanceof WorkbenchError && validationValue.error.code === "OPENSPEC_RUNNER_UNAVAILABLE") validation = { state: "unavailable", message: "Strict validation is currently unavailable." };
   else throw validationValue.error;
   return { artifacts: adaptArtifactStatus(statusValue), validation };
 }
@@ -1202,9 +1268,9 @@ function isArchiveReadyChange(change) {
 
 // src/translation.ts
 import { createHash as createHash2, randomUUID } from "node:crypto";
-import { chmod as chmod2, mkdir as mkdir2, readFile as readFile3, rename as rename2, writeFile as writeFile2 } from "node:fs/promises";
+import { chmod as chmod2, mkdir as mkdir2, readFile as readFile4, rename as rename2, writeFile as writeFile2 } from "node:fs/promises";
 import os3 from "node:os";
-import path4 from "node:path";
+import path5 from "node:path";
 var PROTECTED_PATTERNS = [
   /```[\s\S]*?```/gu,
   /`[^`\n]+`/gu,
@@ -1264,10 +1330,10 @@ function screenTranslationBlock(source) {
   return { allowed: true, reason: null };
 }
 function defaultTranslationStateDirectory() {
-  if (process.env.OPEN_SPEC_WORKBENCH_STATE_DIR) return path4.resolve(process.env.OPEN_SPEC_WORKBENCH_STATE_DIR);
-  if (process.platform === "win32") return path4.join(process.env.LOCALAPPDATA ?? os3.homedir(), "OpenSpec Workbench", "translations");
-  if (process.platform === "darwin") return path4.join(os3.homedir(), "Library", "Application Support", "OpenSpec Workbench", "translations");
-  return path4.join(process.env.XDG_STATE_HOME ?? path4.join(os3.homedir(), ".local", "state"), "openspec-workbench", "translations");
+  if (process.env.OPEN_SPEC_WORKBENCH_STATE_DIR) return path5.resolve(process.env.OPEN_SPEC_WORKBENCH_STATE_DIR);
+  if (process.platform === "win32") return path5.join(process.env.LOCALAPPDATA ?? os3.homedir(), "OpenSpec Workbench", "translations");
+  if (process.platform === "darwin") return path5.join(os3.homedir(), "Library", "Application Support", "OpenSpec Workbench", "translations");
+  return path5.join(process.env.XDG_STATE_HOME ?? path5.join(os3.homedir(), ".local", "state"), "openspec-workbench", "translations");
 }
 var TranslationCache = class {
   constructor(directory = defaultTranslationStateDirectory()) {
@@ -1277,7 +1343,7 @@ var TranslationCache = class {
   async get(key) {
     if (!/^[a-f0-9]{64}$/u.test(key)) throw new Error("Invalid translation cache key.");
     try {
-      const value = JSON.parse(await readFile3(path4.join(this.directory, `${key}.json`), "utf8"));
+      const value = JSON.parse(await readFile4(path5.join(this.directory, `${key}.json`), "utf8"));
       return typeof value.value === "string" ? value.value : null;
     } catch (error) {
       if (error.code === "ENOENT" || error instanceof SyntaxError) return null;
@@ -1288,8 +1354,8 @@ var TranslationCache = class {
     if (!/^[a-f0-9]{64}$/u.test(key)) throw new Error("Invalid translation cache key.");
     await mkdir2(this.directory, { recursive: true, mode: 448 });
     await chmod2(this.directory, 448);
-    const target = path4.join(this.directory, `${key}.json`);
-    const temporary = path4.join(this.directory, `.${key}.${process.pid}.${randomUUID()}.tmp`);
+    const target = path5.join(this.directory, `${key}.json`);
+    const temporary = path5.join(this.directory, `.${key}.${process.pid}.${randomUUID()}.tmp`);
     await writeFile2(temporary, JSON.stringify({ value }) + "\n", { encoding: "utf8", mode: 384 });
     await rename2(temporary, target);
   }
@@ -1411,20 +1477,20 @@ var TranslationService = class {
 
 // src/agy-translation.ts
 import os5 from "node:os";
-import path6 from "node:path";
+import path7 from "node:path";
 
 // src/bounded-process.ts
 import { spawn as spawn2 } from "node:child_process";
-import { chmod as chmod3, mkdtemp, readFile as readFile4, rm as rm2, writeFile as writeFile3 } from "node:fs/promises";
+import { chmod as chmod3, mkdtemp, readFile as readFile5, rm as rm2, writeFile as writeFile3 } from "node:fs/promises";
 import os4 from "node:os";
-import path5 from "node:path";
+import path6 from "node:path";
 import process3 from "node:process";
 var MAX_ARGUMENT_BYTES = 128 * 1024;
 var SAFE_ENV_KEYS = ["HOME", "PATH", "TMPDIR", "TMP", "TEMP", "LANG", "LC_ALL", "XDG_CONFIG_HOME", "XDG_DATA_HOME", "XDG_STATE_HOME"];
 function safeRelativeFile(value) {
   if (!/^[A-Za-z0-9][A-Za-z0-9._/-]{0,127}$/u.test(value) || value.includes("//")) throw new Error("Process fixture paths must use the bounded relative shape.");
-  const normalized = path5.posix.normalize(value);
-  if (normalized === "." || normalized.startsWith("../") || path5.posix.isAbsolute(normalized)) throw new Error("Process fixture paths must remain inside the private workspace.");
+  const normalized = path6.posix.normalize(value);
+  if (normalized === "." || normalized.startsWith("../") || path6.posix.isAbsolute(normalized)) throw new Error("Process fixture paths must remain inside the private workspace.");
   return normalized;
 }
 function boundedEnvironment(workspace, additions = {}) {
@@ -1460,13 +1526,13 @@ function terminateProcessTree(child, signal) {
   }
 }
 async function runBoundedProcess(options) {
-  const workspace = await mkdtemp(path5.join(os4.tmpdir(), "openspec-workbench-translation-"));
+  const workspace = await mkdtemp(path6.join(os4.tmpdir(), "openspec-workbench-translation-"));
   await chmod3(workspace, 448);
   try {
     for (const file of options.files ?? []) {
       const relative = safeRelativeFile(file.path);
-      const target = path5.join(workspace, relative);
-      if (path5.dirname(target) !== workspace) throw new Error("Nested process fixture paths are not supported.");
+      const target = path6.join(workspace, relative);
+      if (path6.dirname(target) !== workspace) throw new Error("Nested process fixture paths are not supported.");
       await writeFile3(target, file.content, { encoding: "utf8", mode: file.mode ?? 384, flag: "wx" });
     }
     const args = [...typeof options.args === "function" ? options.args(workspace) : options.args];
@@ -1546,7 +1612,7 @@ async function runBoundedProcess(options) {
           const files = /* @__PURE__ */ new Map();
           for (const file of options.readFiles ?? []) {
             const relative = safeRelativeFile(file);
-            files.set(relative, await readFile4(path5.join(workspace, relative), "utf8"));
+            files.set(relative, await readFile5(path6.join(workspace, relative), "utf8"));
           }
           resolve({ stdout: Buffer.concat(stdout).toString("utf8"), stderr: Buffer.concat(stderr).toString("utf8"), files });
         } catch {
@@ -1668,7 +1734,7 @@ function classifyAgyFailureForTesting(stderr, timedOut = false) {
   return classifyProviderFailure(error).code;
 }
 var AgyTranslationAdapter = class {
-  constructor(executable = process.env.OPEN_SPEC_WORKBENCH_AGY_BIN ?? (process.platform === "darwin" ? path6.join(os5.homedir(), ".local", "bin", "agy") : "agy"), model = process.env.OPEN_SPEC_WORKBENCH_AGY_MODEL ?? "gemini-3.6-flash-high", timeoutMs = 25e4, killGraceMs = 2e3) {
+  constructor(executable = process.env.OPEN_SPEC_WORKBENCH_AGY_BIN ?? (process.platform === "darwin" ? path7.join(os5.homedir(), ".local", "bin", "agy") : "agy"), model = process.env.OPEN_SPEC_WORKBENCH_AGY_MODEL ?? "gemini-3.6-flash-high", timeoutMs = 25e4, killGraceMs = 2e3) {
     this.executable = executable;
     this.model = model;
     this.timeoutMs = timeoutMs;
@@ -1999,15 +2065,15 @@ var OllamaTranslationAdapter = class {
 
 // src/translation-providers.ts
 import os6 from "node:os";
-import path7 from "node:path";
+import path8 from "node:path";
 var translationProviderIds = ["agy", "claude", "codex", "gemini", "qwen", "kimi", "ollama"];
 function defaultExecutable(id) {
   const environmentKey = `OPEN_SPEC_WORKBENCH_${id.toUpperCase()}_BIN`;
   const override = process.env[environmentKey];
   if (override) return override;
   if (process.platform !== "darwin") return id;
-  if (id === "agy" || id === "codex" || id === "qwen") return path7.join(os6.homedir(), ".local", "bin", id);
-  if (id === "kimi") return path7.join(os6.homedir(), ".kimi-code", "bin", "kimi");
+  if (id === "agy" || id === "codex" || id === "qwen") return path8.join(os6.homedir(), ".local", "bin", id);
+  if (id === "kimi") return path8.join(os6.homedir(), ".kimi-code", "bin", "kimi");
   if (id === "claude") return "/opt/homebrew/bin/claude";
   return id;
 }
@@ -2094,8 +2160,8 @@ ${help.stderr}`;
 import { createHash as createHash3 } from "node:crypto";
 import { EventEmitter as EventEmitter2 } from "node:events";
 import { watch } from "node:fs";
-import { lstat as lstat3, readFile as readFile5, readdir, readlink } from "node:fs/promises";
-import path8 from "node:path";
+import { lstat as lstat4, readFile as readFile6, readdir, readlink } from "node:fs/promises";
+import path9 from "node:path";
 var MAX_OPEN_SPEC_ENTRIES = 1e4;
 var MAX_OPEN_SPEC_FILE_BYTES = 2 * 1024 * 1024;
 var MAX_OPEN_SPEC_TOTAL_BYTES = 32 * 1024 * 1024;
@@ -2104,11 +2170,11 @@ var FILESYSTEM_SETTLE_MS = 50;
 async function openSpecContentState(root) {
   const hash = createHash3("sha256");
   const fingerprints = /* @__PURE__ */ new Map();
-  const openSpecRoot = path8.join(root, "openspec");
+  const openSpecRoot = path9.join(root, "openspec");
   let entries = 0;
   let bytes = 0;
   const visit = async (absolute, relative) => {
-    const info = await lstat3(absolute);
+    const info = await lstat4(absolute);
     entries += 1;
     if (entries > MAX_OPEN_SPEC_ENTRIES) throw new WorkbenchError("OPEN_SPEC_CONTENT_LIMIT", "OpenSpec contains too many entries to read safely.", 413);
     if (info.isSymbolicLink()) {
@@ -2123,14 +2189,14 @@ async function openSpecContentState(root) {
       hash.update(`directory\0${relative}\0`);
       fingerprints.set(relative, "directory");
       const children = (await readdir(absolute)).sort((left, right) => left.localeCompare(right, "en"));
-      for (const child of children) await visit(path8.join(absolute, child), path8.posix.join(relative, child));
+      for (const child of children) await visit(path9.join(absolute, child), path9.posix.join(relative, child));
       return;
     }
     if (info.isFile()) {
       if (info.size > MAX_OPEN_SPEC_FILE_BYTES || bytes + info.size > MAX_OPEN_SPEC_TOTAL_BYTES) {
         throw new WorkbenchError("OPEN_SPEC_CONTENT_LIMIT", "OpenSpec content exceeds the safe reading limit.", 413);
       }
-      const content = await readFile5(absolute);
+      const content = await readFile6(absolute);
       bytes += content.length;
       hash.update(`file\0${relative}\0${content.length}\0`);
       hash.update(content);
@@ -2193,8 +2259,8 @@ var SnapshotWatcher = class _SnapshotWatcher extends EventEmitter2 {
   }
   start() {
     const targets = [
-      { target: path8.join(this.snapshot.root, "openspec"), recursive: true, changed: () => this.#queueFilesystemCheck() },
-      { target: path8.join(this.snapshot.gitDir, "HEAD"), recursive: false, changed: () => void this.poll() }
+      { target: path9.join(this.snapshot.root, "openspec"), recursive: true, changed: () => this.#queueFilesystemCheck() },
+      { target: path9.join(this.snapshot.gitDir, "HEAD"), recursive: false, changed: () => void this.poll() }
     ];
     for (const { target, recursive, changed } of targets) {
       try {
@@ -2337,31 +2403,70 @@ var SnapshotWatcher = class _SnapshotWatcher extends EventEmitter2 {
 // src/registration.ts
 import { randomBytes as randomBytes2 } from "node:crypto";
 import { spawn as spawn3 } from "node:child_process";
-import path9 from "node:path";
+import path10 from "node:path";
 var PICKER_CANCELLED = "__OPENSPEC_PICKER_CANCELLED__";
+var PICKER_NO_GUI = "__OPENSPEC_PICKER_NO_GUI__";
 var PICKER_SOURCE = `try
   set selectedFolder to choose folder with prompt "Choose an OpenSpec project folder"
   return POSIX path of selectedFolder
 on error number -128
   return "${PICKER_CANCELLED}"
 end try`;
+var WINDOWS_PICKER_SOURCE = `$ErrorActionPreference = 'Stop'
+Add-Type -AssemblyName System.Windows.Forms
+if (-not [Environment]::UserInteractive) {
+  [Console]::Out.Write('${PICKER_NO_GUI}')
+  exit 3
+}
+$dialog = New-Object System.Windows.Forms.FolderBrowserDialog
+$dialog.Description = 'Choose an OpenSpec project folder'
+$dialog.ShowNewFolderButton = $false
+$result = $dialog.ShowDialog()
+if ($result -eq [System.Windows.Forms.DialogResult]::OK) {
+  $bytes = [System.Text.Encoding]::UTF8.GetBytes($dialog.SelectedPath)
+  [Console]::Out.Write([Convert]::ToBase64String($bytes))
+} else {
+  [Console]::Out.Write('${PICKER_CANCELLED}')
+}`;
 function decodeMacFolderPickerOutputForTesting(stdout) {
   const value = stdout.endsWith("\n") ? stdout.slice(0, -1) : stdout;
   if (value === PICKER_CANCELLED) return null;
   if (value.startsWith("/") && value.length > 0) return value;
   throw new WorkbenchError("PICKER_OUTPUT_INVALID", "The native folder chooser returned an invalid selection.", 502);
 }
+function decodeWindowsFolderPickerOutputForTesting(stdout) {
+  const value = stdout.endsWith("\r\n") ? stdout.slice(0, -2) : stdout.endsWith("\n") ? stdout.slice(0, -1) : stdout;
+  if (value === PICKER_CANCELLED) return null;
+  if (value === PICKER_NO_GUI) throw new WorkbenchError("NO_GUI_SESSION", "No interactive Windows session is available for folder selection.", 503);
+  if (!/^(?:[A-Za-z0-9+/]{4})*(?:[A-Za-z0-9+/]{2}==|[A-Za-z0-9+/]{3}=)?$/u.test(value) || value.length === 0) {
+    throw new WorkbenchError("PICKER_OUTPUT_INVALID", "The native folder chooser returned an invalid selection.", 502);
+  }
+  const decoded = Buffer.from(value, "base64").toString("utf8");
+  if (Buffer.from(decoded, "utf8").toString("base64") !== value || decoded.includes("\0") || !path10.win32.isAbsolute(decoded)) {
+    throw new WorkbenchError("PICKER_OUTPUT_INVALID", "The native folder chooser returned an invalid selection.", 502);
+  }
+  return decoded;
+}
 var MacFolderPicker = class {
+  constructor(spawnProcess = spawn3, platform = process.platform) {
+    this.spawnProcess = spawnProcess;
+    this.platform = platform;
+  }
+  spawnProcess;
+  platform;
   child = null;
+  get available() {
+    return this.platform === "darwin";
+  }
   async pick() {
-    if (process.platform !== "darwin") throw new WorkbenchError("PICKER_UNSUPPORTED", "Native folder selection is supported on macOS only.", 501);
+    if (!this.available) throw new WorkbenchError("PICKER_UNSUPPORTED", "Native folder selection is supported on macOS only.", 501);
     if (this.child) throw new WorkbenchError("PICKER_BUSY", "A folder chooser is already open.", 409);
     return new Promise((resolve, reject) => {
       let stdout = "";
       let stderr = "";
       let overflow = false;
       let timedOut = false;
-      const child = spawn3("/usr/bin/osascript", ["-e", PICKER_SOURCE], { stdio: ["ignore", "pipe", "pipe"] });
+      const child = this.spawnProcess("/usr/bin/osascript", ["-e", PICKER_SOURCE], { shell: false, stdio: ["ignore", "pipe", "pipe"] });
       this.child = child;
       const timer = setTimeout(() => {
         timedOut = true;
@@ -2404,8 +2509,92 @@ var MacFolderPicker = class {
     if (this.child?.exitCode === null && this.child.signalCode === null) this.child.kill("SIGTERM");
   }
 };
+var WindowsFolderPicker = class {
+  constructor(spawnProcess = spawn3, systemRoot = process.env.SystemRoot ?? "C:\\Windows", timeoutMs = 2 * 6e4, platform = process.platform) {
+    this.spawnProcess = spawnProcess;
+    this.systemRoot = systemRoot;
+    this.timeoutMs = timeoutMs;
+    this.platform = platform;
+  }
+  spawnProcess;
+  systemRoot;
+  timeoutMs;
+  platform;
+  child = null;
+  get available() {
+    return this.platform === "win32";
+  }
+  async pick() {
+    if (!this.available) throw new WorkbenchError("PICKER_UNSUPPORTED", "Native Windows folder selection is unavailable on this platform.", 501);
+    if (this.child) throw new WorkbenchError("PICKER_BUSY", "A folder chooser is already open.", 409);
+    return new Promise((resolve, reject) => {
+      let stdout = "";
+      let stderr = "";
+      let overflow = false;
+      let timedOut = false;
+      const executable = path10.win32.join(this.systemRoot, "System32", "WindowsPowerShell", "v1.0", "powershell.exe");
+      const child = this.spawnProcess(executable, ["-NoLogo", "-NoProfile", "-NonInteractive", "-STA", "-Command", WINDOWS_PICKER_SOURCE], {
+        shell: false,
+        windowsHide: true,
+        stdio: ["ignore", "pipe", "pipe"]
+      });
+      this.child = child;
+      const timer = setTimeout(() => {
+        timedOut = true;
+        child.kill("SIGKILL");
+      }, this.timeoutMs);
+      child.stdout.setEncoding("utf8");
+      child.stdout.on("data", (chunk) => {
+        stdout += chunk;
+        if (Buffer.byteLength(stdout) > 64 * 1024) {
+          overflow = true;
+          child.kill("SIGKILL");
+        }
+      });
+      child.stderr.setEncoding("utf8");
+      child.stderr.on("data", (chunk) => {
+        stderr = `${stderr}${chunk}`.slice(-4096);
+      });
+      child.once("error", () => {
+        clearTimeout(timer);
+        this.child = null;
+        reject(new WorkbenchError("PICKER_UNAVAILABLE", "The native Windows folder chooser could not start.", 503));
+      });
+      child.once("close", (code) => {
+        clearTimeout(timer);
+        this.child = null;
+        if (overflow) return reject(new WorkbenchError("PICKER_OUTPUT_LIMIT", "The native folder chooser returned too much data.", 502));
+        if (timedOut) return reject(new WorkbenchError("PICKER_TIMEOUT", "The native folder chooser timed out.", 504));
+        if (stdout === PICKER_NO_GUI || stdout === `${PICKER_NO_GUI}\r
+` || stdout === `${PICKER_NO_GUI}
+`) return reject(new WorkbenchError("NO_GUI_SESSION", "No interactive Windows session is available for folder selection.", 503));
+        if (code !== 0 && /access|denied|permission|unauthorized/iu.test(stderr)) return reject(new WorkbenchError("PICKER_PERMISSION_DENIED", "Windows denied access to the selected folder.", 403));
+        if (code !== 0) return reject(new WorkbenchError("PICKER_FAILED", "The native Windows folder chooser could not complete.", 502));
+        try {
+          resolve(decodeWindowsFolderPickerOutputForTesting(stdout));
+        } catch (error) {
+          reject(error);
+        }
+      });
+    });
+  }
+  async close() {
+    if (this.child?.exitCode === null && this.child.signalCode === null) this.child.kill("SIGTERM");
+  }
+};
+var UnsupportedFolderPicker = class {
+  available = false;
+  async pick() {
+    throw new WorkbenchError("PICKER_UNSUPPORTED", "Native folder selection is unavailable on this platform.", 501);
+  }
+};
+function createNativeFolderPicker(platform = process.platform) {
+  if (platform === "darwin") return new MacFolderPicker(spawn3, platform);
+  if (platform === "win32") return new WindowsFolderPicker(spawn3, process.env.SystemRoot ?? "C:\\Windows", 2 * 6e4, platform);
+  return new UnsupportedFolderPicker();
+}
 var RegistrationIntents = class {
-  constructor(picker = new MacFolderPicker(), ttlMs = 2 * 6e4) {
+  constructor(picker = createNativeFolderPicker(), ttlMs = 2 * 6e4) {
     this.picker = picker;
     this.ttlMs = ttlMs;
   }
@@ -2513,7 +2702,7 @@ var RegistrationIntents = class {
       state: intent.state,
       preview: intent.candidate ? {
         root: intent.candidate.root,
-        detectedName: path9.basename(intent.candidate.root),
+        detectedName: path10.basename(intent.candidate.root),
         branch: intent.candidate.branch,
         detached: intent.candidate.branch === null,
         kind: intent.candidate.kind
@@ -2536,6 +2725,7 @@ export {
   ActivityJournal,
   AgyTranslationAdapter,
   CliTranslationAdapter,
+  MacFolderPicker,
   OllamaTranslationAdapter,
   ProjectRegistry,
   RegistrationIntents,
@@ -2544,6 +2734,7 @@ export {
   TranslationCache,
   TranslationProviderRegistry,
   TranslationService,
+  WindowsFolderPicker,
   WorkbenchError,
   activityDiagnostic,
   activityKinds,
@@ -2561,8 +2752,10 @@ export {
   classifyAgyFailureForTesting,
   classifyProviderFailure,
   compatibilityManifest,
+  createNativeFolderPicker,
   createPinnedOpenSpecRunner,
   decodeMacFolderPickerOutputForTesting,
+  decodeWindowsFolderPickerOutputForTesting,
   defaultTranslationStateDirectory,
   defaultWorkbenchStateDirectory,
   deriveTreeParents,
@@ -2577,6 +2770,7 @@ export {
   isTranslationProviderPreference,
   listChanges,
   maskProtectedText,
+  npmCliCandidatesForTesting,
   openSpecContentIdentity,
   openSpecContentState,
   parseAgyTranslationOutput,

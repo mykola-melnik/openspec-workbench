@@ -434,7 +434,11 @@ async function main(): Promise<void> {
     process.stdout.write(`${JSON.stringify({ removed: removed.id, label: removed.label })}\n`);
     return;
   }
-  if (process.argv.includes("--hub")) {
+  const rootFlag = process.argv.indexOf("--root");
+  const projectMode = command === "project" || rootFlag >= 0 || process.argv.includes("--machine");
+  const knownCommand = command === undefined || command.startsWith("--") || ["register", "projects", "remove", "project"].includes(command);
+  if (!knownCommand) throw new WorkbenchError("COMMAND_INVALID", "The requested Workbench command is not supported.", 400);
+  if (!projectMode) {
     const portFlag = process.argv.indexOf("--port");
     const portValue = portFlag >= 0 ? process.argv[portFlag + 1] : undefined;
     const requestedPort = portValue === undefined ? 0 : Number(portValue);
@@ -448,10 +452,21 @@ async function main(): Promise<void> {
     process.stdout.write(`OpenSpec Projects Hub\n${hub.url}\n`);
     return;
   }
-  const rootFlag = process.argv.indexOf("--root");
-  const root = rootFlag >= 0 ? process.argv[rootFlag + 1] : process.cwd();
+  const root = rootFlag >= 0 ? process.argv[rootFlag + 1] : undefined;
   if (!root) throw new WorkbenchError("ROOT_REQUIRED", "--root requires a project directory.", 400);
-  const instance = await startWorkbench(root);
+  if (!path.isAbsolute(root)) throw new WorkbenchError("ROOT_ABSOLUTE_REQUIRED", "--root requires an absolute project directory.", 400);
+  let canonicalRoot: string;
+  try {
+    canonicalRoot = realpathSync(root);
+  } catch {
+    throw new WorkbenchError("ROOT_INVALID", "--root must name an existing project directory.", 400);
+  }
+  const resolvedRoot = path.resolve(root);
+  const sameCanonicalPath = process.platform === "win32"
+    ? canonicalRoot.toLocaleLowerCase("en-US") === resolvedRoot.toLocaleLowerCase("en-US")
+    : canonicalRoot === resolvedRoot;
+  if (!sameCanonicalPath) throw new WorkbenchError("ROOT_CANONICAL_REQUIRED", "--root must use the canonical project directory.", 400);
+  const instance = await startWorkbench(canonicalRoot);
   if (process.argv.includes("--machine")) {
     process.stdout.write(`${JSON.stringify({ url: instance.url, origin: instance.origin, token: instance.token, pid: process.pid })}\n`);
   } else {

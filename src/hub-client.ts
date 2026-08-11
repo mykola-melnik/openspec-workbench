@@ -76,13 +76,18 @@ class ApiError extends Error {
 
 function localizedError(error: unknown, fallback: string): string {
   if (!(error instanceof ApiError)) return error instanceof Error ? error.message : fallback;
-  if (["PICKER_UNSUPPORTED", "PICKER_UNAVAILABLE", "NO_GUI_SESSION", "PICKER_FAILED", "PICKER_OUTPUT_INVALID", "PICKER_OUTPUT_LIMIT"].includes(error.code)) return copy.pickerUnavailable;
+  if (["PICKER_UNSUPPORTED", "PICKER_UNAVAILABLE", "PICKER_FAILED", "PICKER_OUTPUT_INVALID", "PICKER_OUTPUT_LIMIT"].includes(error.code)) return copy.pickerUnavailable;
+  if (error.code === "NO_GUI_SESSION") return copy.pickerNoGuiSession;
   if (error.code === "PICKER_BUSY") return copy.pickerBusy;
   if (error.code === "PICKER_TIMEOUT") return copy.pickerTimedOut;
   if (error.code === "PICKER_PERMISSION_DENIED") return copy.pickerPermissionDenied;
   if (["INVALID_ROOT", "INVALID_GIT_ROOT", "PROJECT_ROOT_REQUIRED", "OPEN_SPEC_REQUIRED", "OPEN_SPEC_CONFIG_TOO_LARGE"].includes(error.code)) return copy.invalidOpenSpecFolder;
   if (error.code === "PROJECT_ALREADY_REGISTERED") return copy.projectAlreadyRegistered;
   if (error.code === "OPENSPEC_TIMEOUT") return copy.openSpecTimedOut;
+  if (error.code === "OPENSPEC_RUNNER_UNAVAILABLE") return copy.openSpecRunnerUnavailable;
+  if (error.code === "OPENSPEC_SCRIPT_MISSING") return copy.openSpecScriptMissing;
+  if (error.code === "OPENSPEC_COMMAND_FAILED") return copy.openSpecCommandFailed;
+  if (error.code === "OPENSPEC_OUTPUT_LIMIT") return copy.openSpecOutputLimit;
   if (["OPENSPEC_VERSION_UNSUPPORTED", "COMPATIBILITY_MANIFEST_INVALID", "OPENSPEC_OUTPUT_INVALID"].includes(error.code)) return copy.compatibilityFailure;
   if (["REGISTRATION_INTENT_NOT_FOUND", "REGISTRATION_INTENT_CONSUMED"].includes(error.code)) return copy.registrationExpired;
   if (["REGISTRY_CONFLICT", "REGISTRATION_CANDIDATE_CHANGED"].includes(error.code)) return copy.registrationConflict;
@@ -269,6 +274,7 @@ async function start(): Promise<void> {
   const bootstrap = await api<{ csrf: string; registrationAvailable: boolean }>("/api/bootstrap");
   csrf = bootstrap.csrf;
   addProject.hidden = !bootstrap.registrationAvailable;
+  addProject.disabled = !bootstrap.registrationAvailable;
   await renderProjects();
 }
 
