@@ -50,7 +50,7 @@
     "verify:release": "npm run verify && npm run docs:build && npm run check:release"
   },
   "devDependencies": {
-    "@fission-ai/openspec": "1.7.0",
+    "@fission-ai/openspec": "1.8.0",
     "@types/node": "22.20.1",
     "esbuild": "0.28.1",
     "typescript": "7.0.2",
