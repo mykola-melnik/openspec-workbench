@@ -1,0 +1,41 @@
+schema: spec-driven
+
+context: |
+  Repository: the standalone source, tests, deterministic release runtime, and
+  documentation for the machine-local OpenSpec Workbench application.
+  Artifact language: English for every proposal, specification, design, task,
+  and verification note. Exact localized UI copy may appear only when marked
+  with its locale on the same line.
+  Planning: OpenSpec files reviewed in Git remain the sole source of truth.
+  Generated views and local caches are derived state.
+  Releases: application tags are immutable and independent from standards and
+  consumer adoption pins.
+  Boundaries: central standards own the integration contract; consumer
+  projects own their plans and Git state; the application owns only derived
+  machine-local navigation and presentation state.
+
+rules:
+  proposal:
+    - Identify application behavior, compatibility impact, consumer impact, and release strategy.
+    - State non-goals, compatibility impact, security boundary, and release strategy.
+    - Keep technical prose in English and mark exact localized copy with its locale.
+  specs:
+    - Describe observable behavior with testable GIVEN-WHEN-THEN scenarios, including negative and stale-state cases.
+    - Preserve Git-reviewed OpenSpec files as the only authoritative planning state.
+    - Keep technical prose in English and mark exact localized copy with its locale.
+  design:
+    - Separate application runtime ownership, central contract ownership, and consumer repository ownership.
+    - Address local-server security, filesystem boundaries, version compatibility, localization, and rollback.
+    - Identify executable verification for every material boundary.
+  tasks:
+    - Include exact verification commands and the evidence each command must produce.
+    - Do not mark work complete without proportionate automated or reproducible evidence.
+    - Keep user-visible implementation behind explicit design approval.
+
+operations:
+  apply:
+    guidance:
+      - Keep main releasable and record verification before marking tasks complete.
+  archive:
+    guidance:
+      - Run strict OpenSpec validation and the complete application verification suite before archiving.

@@ -1,0 +1,56 @@
+<!doctype html>
+<html lang="uk">
+  <head>
+    <meta charset="utf-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1">
+    <meta name="color-scheme" content="light dark">
+    <title>OpenSpec Projects Hub</title>
+    <link rel="icon" href="/favicon.svg" type="image/svg+xml">
+    <link rel="stylesheet" href="/hub.css">
+  </head>
+  <body>
+    <a id="hub-skip-link" class="skip-link" href="#projects">Skip to projects</a>
+    <header class="hub-brandbar">
+      <img class="app-mark" src="/favicon.svg" alt="" width="64" height="64">
+      <p class="eyebrow">OpenSpec Workbench</p>
+    </header>
+    <main>
+      <header class="hub-header">
+        <div>
+          <h1 id="hub-title">My projects</h1>
+          <p id="hub-description">Only projects explicitly registered on this computer.</p>
+        </div>
+        <button id="add-project" type="button">Add project</button>
+      </header>
+      <section id="state" class="state" aria-live="polite">Reading the local registry…</section>
+      <section id="projects" class="project-grid" aria-label="Registered projects"></section>
+    </main>
+    <dialog id="registration-dialog" aria-labelledby="registration-title">
+      <form id="registration-form" method="dialog">
+        <h2 id="registration-title">Register project</h2>
+        <p id="registration-summary"></p>
+        <dl id="registration-details"></dl>
+        <label id="registration-label-text" for="registration-label">Project name</label>
+        <input id="registration-label" name="label" maxlength="120" required autocomplete="off">
+        <p id="registration-error" class="reason" aria-live="polite"></p>
+        <div class="dialog-actions">
+          <button id="registration-cancel" type="button">Cancel</button>
+          <button id="registration-confirm" type="submit">Register</button>
+        </div>
+      </form>
+    </dialog>
+    <dialog id="removal-dialog" aria-labelledby="removal-title">
+      <form id="removal-form" method="dialog">
+        <h2 id="removal-title">Remove from Hub</h2>
+        <p id="removal-summary"></p>
+        <p id="removal-safety"></p>
+        <p id="removal-error" class="reason" aria-live="polite"></p>
+        <div class="dialog-actions">
+          <button id="removal-cancel" type="button">Cancel</button>
+          <button id="removal-confirm" class="danger" type="submit">Remove from Hub</button>
+        </div>
+      </form>
+    </dialog>
+    <script src="/hub.js" defer></script>
+  </body>
+</html>

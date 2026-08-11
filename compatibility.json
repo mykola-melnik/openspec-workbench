@@ -1,0 +1,16 @@
+{
+  "$schema": "./docs/compatibility.schema.json",
+  "version": 1,
+  "application": "0.1.0",
+  "openspec": {
+    "supported": ["1.7.x"],
+    "adapters": {
+      "1.7.x": "openspec-1.7"
+    }
+  },
+  "standards": {
+    "provenanceFile": "standards.version",
+    "required": false
+  },
+  "unknownFormatPolicy": "fail-closed"
+}

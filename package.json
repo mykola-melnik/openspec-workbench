@@ -1,0 +1,57 @@
+{
+  "name": "openspec-workbench",
+  "version": "0.1.0",
+  "private": true,
+  "type": "module",
+  "description": "Read-only local web application for Git-reviewed OpenSpec plans.",
+  "license": "MIT",
+  "keywords": [
+    "openspec",
+    "planning",
+    "developer-tools",
+    "local-first",
+    "read-only"
+  ],
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/mykola-melnik/openspec-workbench.git"
+  },
+  "homepage": "https://github.com/mykola-melnik/openspec-workbench#readme",
+  "bugs": {
+    "url": "https://github.com/mykola-melnik/openspec-workbench/issues"
+  },
+  "scripts": {
+    "openspec": "openspec",
+    "openspec:doctor": "npm run openspec -- doctor --json",
+    "openspec:validate": "npm run openspec -- validate --all --strict --no-interactive",
+    "build": "node scripts/build.mjs",
+    "start": "npm run build -- --outdir .workbench-build && node .workbench-build/server.mjs",
+    "hub": "npm run build -- --outdir .workbench-build && node .workbench-build/server.mjs --hub",
+    "hub:local": "node dist/server.mjs --hub --port 4057 --public-origin https://plans.internal",
+    "project:register": "node dist/server.mjs register",
+    "projects": "node dist/server.mjs projects",
+    "project:remove": "node dist/server.mjs remove",
+    "typecheck": "tsc -p tsconfig.json",
+    "test": "npm run build -- --outdir .workbench-build && node --test test/core.test.mjs test/compatibility.test.mjs test/ui-contract.test.mjs test/e2e.test.mjs",
+    "test:e2e": "npm run build -- --outdir .workbench-build && node --test test/e2e.test.mjs",
+    "test:security": "npm run build -- --outdir .workbench-build && node --test --test-name-pattern=\"hostile|trusted\" test/e2e.test.mjs",
+    "test:contrast": "node --test test/contrast.test.mjs",
+    "test:public": "node --test test/public-readiness.test.mjs",
+    "check:public": "node scripts/check-public.mjs",
+    "check:github": "node scripts/check-github-config.mjs",
+    "prepare:public-snapshot": "node scripts/prepare-public-snapshot.mjs",
+    "check:public-history": "node scripts/check-public-history.mjs",
+    "verify:bundle": "node scripts/verify-bundle.mjs",
+    "verify": "npm run openspec:doctor && npm run openspec:validate && npm run typecheck && npm test && npm run test:security && npm run test:contrast && npm run test:public && npm run check:public && npm run check:github && npm run verify:bundle"
+  },
+  "devDependencies": {
+    "@fission-ai/openspec": "1.7.0",
+    "@types/node": "22.20.1",
+    "esbuild": "0.28.1",
+    "typescript": "7.0.2",
+    "yaml": "2.9.0"
+  },
+  "engines": {
+    "node": ">=20.20.0"
+  }
+}

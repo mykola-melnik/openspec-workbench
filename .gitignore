@@ -1,0 +1,15 @@
+.DS_Store
+.env
+.env.*
+!.env.example
+.idea/
+.vscode/
+.claude/settings.local.json
+node_modules/
+coverage/
+.workbench-build/
+.openspec-workbench/
+/.codex-runtime/
+.public-snapshot/
+*.local
+*.log

@@ -1,0 +1,80 @@
+<!doctype html>
+<html lang="uk">
+  <head>
+    <meta charset="utf-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1">
+    <meta name="color-scheme" content="light dark">
+    <title>OpenSpec Workbench</title>
+    <link rel="icon" href="favicon.svg" type="image/svg+xml">
+    <link rel="stylesheet" href="styles.css">
+  </head>
+  <body>
+    <a id="skip-link" class="skip-link" href="#content">Skip to plan</a>
+    <div id="app" aria-busy="true">
+      <header id="topbar" class="topbar" aria-label="Project context">
+        <a id="brand-home" class="brand-context" href="#content">
+          <img class="app-mark" src="favicon.svg" alt="" width="64" height="64">
+          <div>
+            <p class="eyebrow">OpenSpec Workbench</p>
+            <h1 id="project-name">Loading…</h1>
+          </div>
+        </a>
+        <div class="project-context-actions">
+          <details id="activity-details" class="activity-details">
+            <summary id="activity-summary">Activity</summary>
+            <div class="activity-panel">
+              <p id="activity-note"></p>
+              <ol id="activity-list" class="activity-list"></ol>
+            </div>
+          </details>
+          <details id="branch-selector" class="branch-selector">
+            <summary id="branch-summary">Branches</summary>
+            <div class="branch-panel">
+              <label id="branch-search-label" for="branch-search">Search local branches</label>
+              <input id="branch-search" type="search" autocomplete="off" placeholder="Branch name…">
+              <div id="branch-list" class="branch-list" role="list"></div>
+            </div>
+          </details>
+          <dl id="provenance" class="provenance"></dl>
+        </div>
+      </header>
+      <div id="stale-banner" class="banner" hidden></div>
+      <div class="workspace">
+        <aside id="sidebar" class="sidebar" aria-label="OpenSpec changes" data-collapsed="true">
+          <button id="change-list-toggle" class="change-list-toggle" type="button" aria-expanded="false" aria-controls="change-list">Show plans</button>
+          <label id="change-search-label" for="change-search">Search plans</label>
+          <input id="change-search" type="search" placeholder="Change name…" autocomplete="off">
+          <nav id="change-list" aria-label="Change list"></nav>
+        </aside>
+        <main id="content" tabindex="-1">
+          <div class="plan-controls">
+            <div id="language-switch" class="segmented" role="group" aria-label="Plan language">
+              <button id="language-uk" type="button" data-language="uk">Ukrainian</button>
+              <button id="language-en" type="button" data-language="en" aria-pressed="true">English</button>
+              <button id="language-side" type="button" data-language="side">Side by side</button>
+            </div>
+            <details id="translation-settings" class="translation-settings">
+              <summary id="translation-settings-summary">Translation settings</summary>
+              <div class="translation-settings-panel">
+                <label id="translation-provider-label" for="translation-provider">Translation provider</label>
+                <select id="translation-provider">
+                  <option value="none">No provider</option>
+                </select>
+                <p id="translation-provider-help"></p>
+                <div id="ollama-model-settings" hidden>
+                  <label id="ollama-model-label" for="ollama-model">Ollama model</label>
+                  <select id="ollama-model"></select>
+                </div>
+                <p id="translation-provider-status" role="status"></p>
+              </div>
+            </details>
+          </div>
+          <section id="state" class="state" aria-live="polite">Reading plans from this worktree…</section>
+          <article id="change-detail" hidden></article>
+        </main>
+      </div>
+      <p id="activity-live" class="sr-only" aria-live="polite"></p>
+    </div>
+    <script src="client.js" defer></script>
+  </body>
+</html>
